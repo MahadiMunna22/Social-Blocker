@@ -109,7 +109,11 @@ class BlockOverlay(private val context: Context, private val onDismiss: () -> Un
     )
 }
 
-/** Sends the user to the launcher, which moves whatever app is open to the background. */
+/**
+ * Sends the user to the launcher, which moves whatever app is open to the background.
+ * NO_USER_ACTION suppresses the "user is leaving" signal apps use to auto-enter picture-in-picture.
+ */
 fun Context.goHome() = startActivity(
-    Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+    Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME)
+        .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_ACTIVITY_NO_USER_ACTION),
 )

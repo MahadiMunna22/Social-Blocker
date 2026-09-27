@@ -3,11 +3,11 @@
 Personal-use Android 13+ app that limits selected social apps. It runs a foreground service that polls `UsageStatsManager` about once a second while the screen is on (it sleeps while the screen is off). When an app is blocked, the service closes it and shows a block card over the home screen.
 
 ## Rules (strictest wins)
-1. **Morning lockout**: all tracked apps are blocked for N min (default 30) after the day's first unlock.
+1. **Morning lockout**: all tracked apps are blocked for N min (default 30) after the first unlock once morning starts (default 6:00, set in Settings). Unlocks during the night don't trigger it.
 2. **Session cooldown**: after N min (default 10) of use, with up to 90 s of backgrounding allowed, the app is blocked for M min (default 30).
 3. **Daily cap**: after N min (default 60) in a day, the app is blocked until midnight.
 
-While a tracked app is open, a draggable timer at the top of the screen counts down to the next block. It turns amber with 1 minute left and red with 30 seconds left. At 0:00 the app is closed: you're sent to the home screen, its audio or video is paused, and a block card says why and for how long. Tap **OK** to dismiss it. Opening a blocked app again closes it again.
+While a tracked app is open, a draggable timer at the top of the screen counts down to the next block. It turns amber with 1 minute left and red with 30 seconds left. At 0:00 the app is closed: you're sent to the home screen, its audio or video is paused, and a block card says why and for how long. Tap **OK** to dismiss it. Opening a blocked app again closes it again. Picture-in-picture counts as use too: the timer keeps running, and at 0:00 the PiP window is brought back to full screen and closed.
 
 The ongoing notification names the app in use and its time left, or which apps are blocked and for how many minutes. Expand it to see every blocked app and all open tasks.
 
@@ -51,7 +51,8 @@ adb shell appops set ch.puc.blocker SYSTEM_ALERT_WINDOW allow
 - **Detection latency is about 1 s**, so a blocked app may flash briefly before the overlay covers it.
 - **OEM battery killers** (Xiaomi, Huawei, Samsung, OnePlus and others) may still stop the service even with the battery exemption. Also allow autostart and "no restrictions" in the vendor settings (see dontkillmyapp.com).
 - **Bypassable by design**: uninstalling the app, revoking usage access or overlay permission, force-stopping it, or changing the system clock all defeat the limits. There is no uninstall protection, because Device Admin can't reliably prevent uninstall and adds complexity.
-- **Morning lockout at midnight**: if the phone is in use at midnight, that moment counts as the new day's "first unlock".
+- **Morning lockout while in use**: if the phone is already unlocked when morning starts, that moment counts as the first unlock.
+- **Picture-in-picture detection** uses "paused but not stopped" usage events, so an app partly covered by another app's dialog also counts as in use.
 - **Time while blocked isn't counted** toward the daily total.
 - **Closing other apps**: Android 14+ doesn't let one app kill another app's process, so a blocked app is closed by moving it to the background and taking audio focus (which pauses well-behaved players). On Android 13 its process is also killed. Its Recents entry can't be removed, but reopening it from Recents closes it again.
 - **Usage counters are saved about every 15 s** (and right away when a cooldown starts or the app changes), not every second.

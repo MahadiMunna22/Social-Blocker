@@ -58,8 +58,7 @@ interface BlockerDao {
     @Query("SELECT * FROM DayState WHERE date = :date")
     fun observeDayState(date: String): Flow<DayState?>
 
-    @Insert(onConflict = androidx.room.OnConflictStrategy.IGNORE)
-    suspend fun insertDayState(d: DayState)
+    @Upsert suspend fun upsertDayState(d: DayState)
 
     // German question bank
     @Query("SELECT * FROM QuizItem")
@@ -126,11 +125,12 @@ class DropVocabTable : AutoMigrationSpec
 @Database(
     entities = [TrackedApp::class, GlobalSettings::class, DailyUsage::class, DayState::class,
         QuizItem::class, ChangeLog::class, ChallengeResult::class, UnlockWait::class, TaskItem::class, RewardUnlock::class],
-    version = 4,
+    version = 5,
     autoMigrations = [
         AutoMigration(from = 1, to = 2),
         AutoMigration(from = 2, to = 3, spec = DropVocabTable::class),
         AutoMigration(from = 3, to = 4),
+        AutoMigration(from = 4, to = 5),
     ],
 )
 abstract class AppDatabase : RoomDatabase() {

@@ -22,6 +22,8 @@ data class GlobalSettings(
     @PrimaryKey val id: Int = 0,
     val blockingEnabled: Boolean = true,
     val morningLockoutMin: Int = 30,
+    /** The lockout starts at the first unlock after this hour, so late-night use doesn't trigger it. */
+    @ColumnInfo(defaultValue = "6") val morningStartHour: Int = 6,
     val sessionGraceSec: Int = 90,
     val challengeType: ChallengeType = ChallengeType.VOCAB,
     val mathDifficulty: Int = 2,

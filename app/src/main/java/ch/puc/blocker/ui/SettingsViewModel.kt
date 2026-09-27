@@ -52,7 +52,10 @@ data class AppRow(
     val decision: Decision,
 )
 
-data class DayTotal(val date: LocalDate, val minutes: Long)
+data class AppMinutes(val packageName: String, val label: String, val minutes: Long)
+
+/** One day in the Reports chart, with the per-app breakdown shown when its bar is tapped (most used first). */
+data class DayTotal(val date: LocalDate, val minutes: Long, val apps: List<AppMinutes> = emptyList())
 
 data class QuizState(
     val questions: List<Question>,
@@ -115,7 +118,8 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
     /** Morning lockout end time if active right now. */
     val morningUntilMs: StateFlow<Long?> = combine(today.flatMapLatest { dao.observeDayState(it) }, settings, now) { d, s, t ->
-        val until = d?.firstUnlockMs?.plus((s?.morningLockoutMin ?: 0) * 60_000L)
+        val until = d?.firstUnlockMs?.takeIf { s != null && it >= Day.todayAtHourMs(s.morningStartHour) }
+            ?.plus((s?.morningLockoutMin ?: 0) * 60_000L)
         until?.takeIf { t < it && s?.blockingEnabled == true }
     }.state(null)
 
@@ -131,15 +135,22 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
             val cfg = ruleConfig(app, gs)
             // A session that has been idle longer than the grace period is effectively over.
             val session = if (t - state.lastSeenMs > cfg.graceMs) 0 else state.sessionMs
-            val decision = if (gs.blockingEnabled && app.enabled) RuleEngine.evaluate(t, day?.firstUnlockMs, Day.startOfTomorrowMs(), cfg, state) else Decision.Allow
+            val firstUnlock = day?.firstUnlockMs?.takeIf { it >= Day.todayAtHourMs(gs.morningStartHour) }
+            val decision = if (gs.blockingEnabled && app.enabled) RuleEngine.evaluate(t, firstUnlock, Day.startOfTomorrowMs(), cfg, state) else Decision.Allow
             AppRow(app, state.totalMs, session, decision)
         }
     }.state(emptyList())
 
     /** Total tracked minutes for each of the last 7 days (oldest first). */
-    val week: StateFlow<List<DayTotal>> = today.flatMapLatest { dao.observeUsageSince(Day.daysAgo(6)) }.map { list ->
-        val byDate = list.groupBy { it.date }.mapValues { (_, v) -> v.sumOf { it.totalMs } / 60_000 }
-        (6 downTo 0).map { LocalDate.now().minusDays(it.toLong()) }.map { DayTotal(it, byDate[it.toString()] ?: 0) }
+    val week: StateFlow<List<DayTotal>> = combine(today.flatMapLatest { dao.observeUsageSince(Day.daysAgo(6)) }, dao.observeApps()) { list, apps ->
+        val labels = apps.associate { it.packageName to it.label }
+        val byDate = list.groupBy { it.date }
+        (6 downTo 0).map { LocalDate.now().minusDays(it.toLong()) }.map { date ->
+            val rows = byDate[date.toString()].orEmpty()
+            val perApp = rows.map { AppMinutes(it.packageName, labels[it.packageName] ?: it.packageName, it.totalMs / 60_000) }
+                .filter { it.minutes > 0 }.sortedByDescending { it.minutes }
+            DayTotal(date, rows.sumOf { it.totalMs } / 60_000, perApp)
+        }
     }.state(emptyList())
 
     val changes: StateFlow<List<ChangeLog>> = dao.observeChanges().state(emptyList())
@@ -347,6 +358,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         dao.upsertSettings(new)
         log("Blocking enabled", old.blockingEnabled, new.blockingEnabled)
         log("Morning lockout (min)", old.morningLockoutMin, new.morningLockoutMin)
+        log("Morning starts at (h)", old.morningStartHour, new.morningStartHour)
         log("Session grace (s)", old.sessionGraceSec, new.sessionGraceSec)
         log("Challenge type", old.challengeType, new.challengeType)
         log("Math difficulty", old.mathDifficulty, new.mathDifficulty)

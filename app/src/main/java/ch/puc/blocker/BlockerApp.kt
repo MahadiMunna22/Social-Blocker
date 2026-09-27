@@ -45,6 +45,7 @@ object Day {
     fun today(): String = LocalDate.now(zone).toString()
     fun daysAgo(n: Long): String = LocalDate.now(zone).minusDays(n).toString()
     fun startOfTodayMs(): Long = LocalDate.now(zone).atStartOfDay(zone).toInstant().toEpochMilli()
+    fun todayAtHourMs(hour: Int): Long = LocalDate.now(zone).atTime(hour, 0).atZone(zone).toInstant().toEpochMilli()
     fun startOfTomorrowMs(): Long = LocalDate.now(zone).plusDays(1).atStartOfDay(zone).toInstant().toEpochMilli()
 }
 

@@ -70,6 +70,8 @@ class BlockerService : LifecycleService() {
         private const val SYSTEM_SYNC_MS = 60_000L
         /** Don't re-send the same app home while the launcher is still coming up. */
         private const val ENFORCE_RETRY_MS = 3_000L
+        /** A normal app switch pauses then stops within a moment; paused this long without a stop means PiP. */
+        private const val PIP_SETTLE_MS = 1_500L
 
         /** True while the service is alive; shown in the UI as a health indicator. */
         @Volatile var running = false
@@ -121,6 +123,8 @@ class BlockerService : LifecycleService() {
     private val dirty = mutableSetOf<String>()
     private var lastFlush = 0L
     private var fgPackage: String? = null
+    /** Package → when it paused without stopping yet (still visible, e.g. picture-in-picture). */
+    private val pausedVisible = mutableMapOf<String, Long>()
     private var lastEventQuery = 0L
     private var lastTick = 0L
     private var lastSystemSync = 0L
@@ -218,18 +222,16 @@ class BlockerService : LifecycleService() {
             TaskNotifications.showReminder(this, openTasks)
         }
 
-        if (firstUnlock == null) {
-            firstUnlock = now
-            dao.insertDayState(DayState(today, now))
-        }
         val previousFg = fgPackage
         updateForeground(now)
         if (fgPackage != previousFg) flush()
 
         val s = settings ?: return
+        updateFirstUnlock(today, now, s)
         val app = fgPackage?.let { apps[it] }
+        val pip = pictureInPictureApp(now)?.takeIf { it != app }
         // Full-day scan only when it can matter: on (re)start, after screen-on and while a tracked app is open.
-        if (lastSystemSync == 0L || (app != null && now - lastSystemSync >= SYSTEM_SYNC_MS)) syncSystemUsage(now)
+        if (lastSystemSync == 0L || ((app != null || pip != null) && now - lastSystemSync >= SYSTEM_SYNC_MS)) syncSystemUsage(now)
 
         if (!s.blockingEnabled) {
             hideAll()
@@ -238,42 +240,12 @@ class BlockerService : LifecycleService() {
             return
         }
 
-        var inUse: String? = null
-        if (app == null) {
-            timer.hide()
-        } else {
-            val pkg = app.packageName
-            val rewardUntil = rewards[pkg] ?: 0
-            if (now < rewardUntil) {
-                // An earned task reward lifts every limit for this app; that time isn't counted.
-                shownBlock = null
-                overlay.hide()
-                timer.show(app.label, Remaining(rewardUntil - now, dailyLimited = false), reward = true)
-                inUse = StatusText.reward(app.label, rewardUntil - now)
-            } else {
-                val cfg = ruleConfig(app, s)
-                var state = usage[pkg] ?: UsageState()
-                var decision = RuleEngine.evaluate(now, firstUnlock, Day.startOfTomorrowMs(), cfg, state)
-                if (decision == Decision.Allow) {
-                    val next = RuleEngine.accrue(state, now, delta, cfg)
-                    usage[pkg] = next
-                    dirty += pkg
-                    if (next.cooldownUntilMs != state.cooldownUntilMs) flush() // a cooldown must survive a restart
-                    state = next
-                    decision = RuleEngine.evaluate(now, firstUnlock, Day.startOfTomorrowMs(), cfg, state)
-                }
-                if (decision is Decision.Block) {
-                    timer.hide()
-                    enforceBlock(app, decision, now)
-                } else {
-                    shownBlock = null
-                    overlay.hide()
-                    val r = RuleEngine.remaining(cfg, state)
-                    timer.show(app.label, r)
-                    inUse = StatusText.inUse(app.label, r)
-                }
-            }
-        }
+        if (app == null && pip == null) timer.hide()
+        if (app == null && pip == null) enforcedPkg = null // reopening it right away gets closed again
+        // A picture-in-picture window is still in use: it counts, shows the timer and gets closed on timeout.
+        val fgLine = app?.let { apply(it, s, now, delta, pip = false, showTimer = true) }
+        val pipLine = pip?.let { apply(it, s, now, delta, pip = true, showTimer = app == null) }
+        val inUse = fgLine ?: pipLine
 
         // Keep the block card (now over the home screen) counting down until dismissed or expired.
         shownBlock?.let { (label, block) -> if (now >= block.untilMs) { shownBlock = null; overlay.hide() } else overlay.show(label, block) }
@@ -282,18 +254,60 @@ class BlockerService : LifecycleService() {
     }
 
     /**
-     * Closes a blocked app: show the block card, send the user home, pause its media and kill its process.
-     * The card goes up first because Android 15+ only lets an overlay app start the launcher while its window is visible.
+     * Applies the rules to one tracked app on screen: counts its time, shows its timer or closes it.
+     * Returns its line for the notification, or null once it's blocked.
      */
-    private fun enforceBlock(app: TrackedApp, block: Decision.Block, now: Long) {
+    private suspend fun apply(app: TrackedApp, s: GlobalSettings, now: Long, delta: Long, pip: Boolean, showTimer: Boolean): String? {
+        val pkg = app.packageName
+        val rewardUntil = rewards[pkg] ?: 0
+        if (now < rewardUntil) {
+            // An earned task reward lifts every limit for this app; that time isn't counted.
+            if (!pip) { shownBlock = null; overlay.hide() }
+            if (showTimer) timer.show(app.label, Remaining(rewardUntil - now, dailyLimited = false), reward = true)
+            return StatusText.reward(app.label, rewardUntil - now)
+        }
+        val cfg = ruleConfig(app, s)
+        var state = usage[pkg] ?: UsageState()
+        var decision = RuleEngine.evaluate(now, firstUnlock, Day.startOfTomorrowMs(), cfg, state)
+        if (decision == Decision.Allow) {
+            val next = RuleEngine.accrue(state, now, delta, cfg)
+            usage[pkg] = next
+            dirty += pkg
+            if (next.cooldownUntilMs != state.cooldownUntilMs) flush() // a cooldown must survive a restart
+            state = next
+            decision = RuleEngine.evaluate(now, firstUnlock, Day.startOfTomorrowMs(), cfg, state)
+        }
+        if (decision is Decision.Block) {
+            if (showTimer) timer.hide()
+            enforceBlock(app, decision, now, pip)
+            return null
+        }
+        if (!pip) { shownBlock = null; overlay.hide() }
+        val r = RuleEngine.remaining(cfg, state)
+        if (showTimer) timer.show(app.label, r)
+        return StatusText.inUse(app.label, r) + if (pip) " (picture-in-picture)" else ""
+    }
+
+    /**
+     * Closes a blocked app: show the block card, send the user home, pause its media and kill its process.
+     * The card goes up first because Android 15+ only lets an overlay app start activities while its window is visible.
+     * A picture-in-picture window is first brought back to full screen, because going home doesn't close it.
+     */
+    private fun enforceBlock(app: TrackedApp, block: Decision.Block, now: Long, pip: Boolean) {
         shownBlock = app.label to block
         overlay.show(app.label, block)
         if (app.packageName == enforcedPkg && now - enforcedAt < ENFORCE_RETRY_MS) return
         enforcedPkg = app.packageName
         enforcedAt = now
-        runCatching { goHome() }.onFailure { Log.w(TAG, "Could not open home screen", it) }
         stopPlayback()
         lifecycleScope.launch {
+            if (pip) {
+                // Relaunching the app expands its PiP window behind the block card.
+                runCatching { packageManager.getLaunchIntentForPackage(app.packageName)?.let { startActivity(it.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) } }
+                    .onFailure { Log.w(TAG, "Could not expand picture-in-picture", it) }
+                delay(600)
+            }
+            runCatching { goHome() }.onFailure { Log.w(TAG, "Could not open home screen", it) }
             delay(800) // the app must be in the background before it can be killed
             // Works up to Android 13; from 14 on Android only allows this for our own app, so going home is the close.
             runCatching { getSystemService(ActivityManager::class.java).killBackgroundProcesses(app.packageName) }
@@ -339,7 +353,20 @@ class BlockerService : LifecycleService() {
         dirty.clear()
         dao.usage(today).forEach { usage[it.packageName] = UsageState(it.totalMs, it.sessionMs, it.lastSeenMs, it.cooldownUntilMs) }
         firstUnlock = dao.dayState(today)?.firstUnlockMs
-            ?: firstUnlockSince(Day.startOfTodayMs(), System.currentTimeMillis())?.also { dao.insertDayState(DayState(today, it)) }
+    }
+
+    /**
+     * The morning lockout counts from the first unlock after the morning start (default 6:00), not midnight.
+     * An unlock stored before that hour (night use, or an older version of the app) is ignored.
+     */
+    private suspend fun updateFirstUnlock(today: String, now: Long, s: GlobalSettings) {
+        val morning = Day.todayAtHourMs(s.morningStartHour)
+        if (firstUnlock?.let { it < morning } == true) firstUnlock = null
+        if (firstUnlock != null || now < morning) return
+        // The earliest unlock since then survives a service restart; if the phone stayed unlocked, it's now.
+        val at = firstUnlockSince(morning, now) ?: now
+        firstUnlock = at
+        dao.upsertDayState(DayState(today, at))
     }
 
     /**
@@ -378,15 +405,25 @@ class BlockerService : LifecycleService() {
         return null
     }
 
-    /** Incrementally replays usage events to track the resumed activity's package. */
+    /**
+     * The tracked app showing a picture-in-picture window, if any. PiP activities are paused but not stopped,
+     * so a pause with no stop after [PIP_SETTLE_MS] means the app is still on screen.
+     * (An app half-covered by another app's dialog looks the same, and counts as in use too.)
+     */
+    private fun pictureInPictureApp(now: Long): TrackedApp? = pausedVisible.entries
+        .firstOrNull { (pkg, pausedAt) -> pkg != fgPackage && now - pausedAt >= PIP_SETTLE_MS && pkg in apps }
+        ?.let { apps[it.key] }
+
+    /** Incrementally replays usage events to track the resumed activity's package and paused-but-visible ones. */
     private fun updateForeground(now: Long) {
         val from = if (lastEventQuery == 0L) now - 60 * 60_000 else lastEventQuery
         val events = usm.queryEvents(from, now)
         lastEventQuery = now
         val e = UsageEvents.Event()
         while (events.getNextEvent(e)) when (e.eventType) {
-            UsageEvents.Event.ACTIVITY_RESUMED -> fgPackage = e.packageName
-            UsageEvents.Event.ACTIVITY_PAUSED -> if (e.packageName == fgPackage) fgPackage = null
+            UsageEvents.Event.ACTIVITY_RESUMED -> { fgPackage = e.packageName; pausedVisible.remove(e.packageName) }
+            UsageEvents.Event.ACTIVITY_PAUSED -> { if (e.packageName == fgPackage) fgPackage = null; pausedVisible[e.packageName] = e.timeStamp }
+            UsageEvents.Event.ACTIVITY_STOPPED -> pausedVisible.remove(e.packageName)
         }
     }
 

@@ -75,6 +75,7 @@ import ch.puc.blocker.domain.WaitState
 import ch.puc.blocker.service.BlockerService
 import java.text.DateFormat
 import java.time.LocalTime
+import java.time.format.DateTimeFormatter
 import java.time.format.TextStyle
 import java.util.Date
 
@@ -354,7 +355,10 @@ private fun ReportsTab(vm: SettingsViewModel) {
                     val avg = if (week.isEmpty()) 0 else week.sumOf { it.minutes } / week.size
                     Text("Daily average", color = MaterialTheme.colorScheme.onSurfaceVariant)
                     Text(hm(avg), style = MaterialTheme.typography.headlineMedium)
-                    WeekChart(week)
+                    // Tap a bar to see that day's apps; today is selected at first.
+                    var selected by rememberSaveable { mutableStateOf(6) }
+                    WeekChart(week, selected) { selected = it }
+                    week.getOrNull(selected)?.let { DayBreakdown(it, isToday = selected == week.lastIndex) }
                 }
             }
         }
@@ -423,21 +427,50 @@ private fun StatCard(label: String, value: String, modifier: Modifier) = WhiteCa
 }
 
 @Composable
-private fun WeekChart(week: List<DayTotal>) {
+private fun DayBreakdown(day: DayTotal, isToday: Boolean) {
+    val locale = LocalConfiguration.current.locales[0]
+    HorizontalDivider(Modifier.padding(vertical = 12.dp), color = MaterialTheme.colorScheme.outlineVariant)
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(
+            if (isToday) "Today" else day.date.format(DateTimeFormatter.ofPattern("EEEE, d MMM", locale)),
+            Modifier.weight(1f), fontWeight = FontWeight.SemiBold,
+        )
+        Text(hm(day.minutes), fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+    }
+    if (day.apps.isEmpty()) {
+        Text("No tracked app use.", Modifier.padding(top = 8.dp), style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant)
+    }
+    val max = (day.apps.maxOfOrNull { it.minutes } ?: 0).coerceAtLeast(1)
+    day.apps.forEach { a ->
+        Row(Modifier.fillMaxWidth().padding(top = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+            AppIcon(a.packageName, a.label, size = 28.dp)
+            Column(Modifier.weight(1f).padding(horizontal = 12.dp)) {
+                Text(a.label, style = MaterialTheme.typography.bodyMedium)
+                Box(Modifier.padding(top = 4.dp).fillMaxWidth(a.minutes.toFloat() / max).height(6.dp)
+                    .background(Accent.copy(alpha = 0.6f), RoundedCornerShape(3.dp)))
+            }
+            Text(hm(a.minutes), style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+        }
+    }
+}
+
+@Composable
+private fun WeekChart(week: List<DayTotal>, selected: Int, onSelect: (Int) -> Unit) {
     val max = (week.maxOfOrNull { it.minutes } ?: 0).coerceAtLeast(1)
     val locale = LocalConfiguration.current.locales[0]
     Row(Modifier.fillMaxWidth().height(170.dp).padding(top = 16.dp), verticalAlignment = Alignment.Bottom) {
         week.forEachIndexed { i, d ->
             val barHeight by animateDpAsState((110 * d.minutes / max).toInt().dp, label = "bar")
-            Column(Modifier.weight(1f).fillMaxHeight(), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Bottom) {
+            Column(Modifier.weight(1f).fillMaxHeight().clip(RoundedCornerShape(8.dp)).clickable { onSelect(i) }, horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.Bottom) {
                 Text("${d.minutes}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Box(
                     Modifier.padding(horizontal = 7.dp, vertical = 4.dp).fillMaxWidth().height(barHeight.coerceAtLeast(4.dp))
-                        .background(if (i == week.lastIndex) Accent else Accent.copy(alpha = 0.25f), RoundedCornerShape(8.dp)),
+                        .background(if (i == selected) Accent else Accent.copy(alpha = 0.25f), RoundedCornerShape(8.dp)),
                 )
                 Text(
                     d.date.dayOfWeek.getDisplayName(TextStyle.SHORT, locale), style = MaterialTheme.typography.labelSmall,
-                    fontWeight = if (i == week.lastIndex) FontWeight.Bold else FontWeight.Normal,
+                    fontWeight = if (i == selected) FontWeight.Bold else FontWeight.Normal,
                 )
             }
         }
@@ -471,8 +504,10 @@ private fun SettingsTab(vm: SettingsViewModel, openSetup: () -> Unit) {
                     }
                     HorizontalDivider(Modifier.padding(vertical = 12.dp), color = MaterialTheme.colorScheme.outlineVariant)
                     ValueSlider("☀ Morning lockout", draft.morningLockoutMin, 0..120, 5, "min", unlocked) { draft = draft.copy(morningLockoutMin = it) }
+                    ValueSlider("🌅 Morning starts at", draft.morningStartHour, 3..11, 1, "am", unlocked) { draft = draft.copy(morningStartHour = it) }
                     ValueSlider("↩ Grace for quick app switches", draft.sessionGraceSec, 0..300, 15, "s", unlocked) { draft = draft.copy(sessionGraceSec = it) }
-                    if (draft.morningLockoutMin != s0.morningLockoutMin || draft.sessionGraceSec != s0.sessionGraceSec) {
+                    if (draft.morningLockoutMin != s0.morningLockoutMin || draft.morningStartHour != s0.morningStartHour ||
+                        draft.sessionGraceSec != s0.sessionGraceSec) {
                         Row(verticalAlignment = Alignment.CenterVertically) {
                             Spacer(Modifier.weight(1f))
                             TextButton(onClick = { draft = s0 }) { Text("Reset") }
