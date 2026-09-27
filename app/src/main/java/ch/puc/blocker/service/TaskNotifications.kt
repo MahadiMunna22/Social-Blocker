@@ -26,8 +26,7 @@ object TaskNotifications {
     const val KEY_TEXT = "task_text"
     const val EXTRA_ID = "task_id"
 
-    fun ensureChannel(ctx: Context) = ctx.getSystemService(NotificationManager::class.java)
-        .createNotificationChannel(NotificationChannel(CHANNEL, "Task reminders", NotificationManager.IMPORTANCE_DEFAULT))
+    fun channel() = NotificationChannel(CHANNEL, "Task reminders", NotificationManager.IMPORTANCE_DEFAULT)
 
     /** "Add task" button with an inline text field: type "Essay 2h" and send. */
     fun addAction(ctx: Context): Notification.Action {
@@ -48,18 +47,38 @@ object TaskNotifications {
         return Notification.Action.Builder(Icon.createWithResource(ctx, R.drawable.ic_notification), "✓ Done", pi).build()
     }
 
-    /** Shows the next open task with Done and Add buttons. [note] confirms the last action. */
-    fun showReminder(ctx: Context, open: List<TaskItem>, note: String? = null) {
-        ensureChannel(ctx)
-        val today = LocalDate.now().toEpochDay()
-        val next = open.minWithOrNull(compareBy({ it.dueEpochDay }, { it.createdMs }))
-        val due = open.count { it.dueEpochDay <= today }
-        val title = note ?: when {
+    private fun next(open: List<TaskItem>) = open.minWithOrNull(compareBy({ it.dueEpochDay }, { it.createdMs }))
+
+    /** "Next: Essay · 120 min", or null when nothing is open. */
+    fun nextLine(open: List<TaskItem>): String? = next(open)?.let { "Next: ${it.title} · ${it.estimateMin} min" }
+
+    /** "2 task(s) due today" / "3 task(s) coming up" / "No open tasks". */
+    fun headline(open: List<TaskItem>): String {
+        val due = open.count { it.dueEpochDay <= LocalDate.now().toEpochDay() }
+        return when {
             open.isEmpty() -> "No open tasks"
             due > 0 -> "$due task(s) due today"
             else -> "${open.size} task(s) coming up"
         }
-        val text = next?.let { "Next: ${it.title} · ${it.estimateMin} min" } ?: "Add something you need to get done."
+    }
+
+    /** One line per task for expanded notifications: "Essay · 120 min · due today". */
+    fun line(t: TaskItem): String {
+        val days = t.dueEpochDay - LocalDate.now().toEpochDay()
+        val due = when {
+            days < 0 -> "overdue"
+            days == 0L -> "due today"
+            days == 1L -> "due tomorrow"
+            else -> "due in $days days"
+        }
+        return "• ${t.title} · ${t.estimateMin} min · $due"
+    }
+
+    /** Shows the next open task with Done and Add buttons. [note] confirms the last action. */
+    fun showReminder(ctx: Context, open: List<TaskItem>, note: String? = null) {
+        val next = next(open)
+        val title = note ?: headline(open)
+        val text = nextLine(open) ?: "Add something you need to get done."
         val openApp = PendingIntent.getActivity(ctx, 2, Intent(ctx, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
         val n = Notification.Builder(ctx, CHANNEL)
             .setSmallIcon(R.drawable.ic_notification)
@@ -75,7 +94,7 @@ object TaskNotifications {
     }
 }
 
-/** Handles the notification buttons, then refreshes both notifications (clears the reply spinner). */
+/** Handles the notification buttons, then re-posts both notifications (clears the reply spinner). */
 class TaskActionReceiver : BroadcastReceiver() {
     override fun onReceive(context: Context, intent: Intent) {
         val app = context.applicationContext as BlockerApp
@@ -99,7 +118,7 @@ class TaskActionReceiver : BroadcastReceiver() {
                     else -> null
                 }
                 TaskNotifications.showReminder(context, dao.openTasks(), note)
-                BlockerService.start(context, BlockerService.ACTION_REFRESH)
+                BlockerService.start(context, BlockerService.ACTION_REFRESH_NOTIFICATION)
             } finally {
                 pending.finish()
             }

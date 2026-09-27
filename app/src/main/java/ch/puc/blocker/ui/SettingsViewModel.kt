@@ -18,7 +18,6 @@ import ch.puc.blocker.data.RewardUnlock
 import ch.puc.blocker.data.TaskItem
 import ch.puc.blocker.data.TrackedApp
 import ch.puc.blocker.data.UnlockWait
-import ch.puc.blocker.data.seedIfEmpty
 import ch.puc.blocker.domain.BankItem
 import ch.puc.blocker.domain.BankKind
 import ch.puc.blocker.domain.ChallengeEngine
@@ -33,6 +32,7 @@ import ch.puc.blocker.domain.WaitState
 import ch.puc.blocker.overlay.BlockOverlay
 import ch.puc.blocker.ruleConfig
 import kotlinx.coroutines.ExperimentalCoroutinesApi
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -183,7 +183,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
     init {
         viewModelScope.launch {
-            dao.seedIfEmpty(application)
+            (application as BlockerApp).seeded.await()
             engine = ChallengeEngine(
                 lastFailureMs = dao.lastFailureMs() ?: 0,
                 waitReadyAtMs = dao.unlockWait()?.readyAtMs ?: 0,
@@ -354,13 +354,17 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
     /** Shows the real block screen for 4 seconds so the overlay permission can be verified. */
     fun previewOverlay() {
-        val overlay = BlockOverlay(getApplication())
-        viewModelScope.launch {
-            repeat(4) {
-                overlay.show("Preview", Decision.Block(Reason.COOLDOWN, System.currentTimeMillis() + 5 * 60_000))
-                delay(TICK_MS)
+        var job: Job? = null
+        val overlay = BlockOverlay(getApplication()) { job?.cancel() } // "OK" ends the preview early
+        job = viewModelScope.launch {
+            try {
+                repeat(4) {
+                    overlay.show("Preview", Decision.Block(Reason.COOLDOWN, System.currentTimeMillis() + 5 * 60_000))
+                    delay(TICK_MS)
+                }
+            } finally {
+                overlay.hide()
             }
-            overlay.hide()
         }
     }
 

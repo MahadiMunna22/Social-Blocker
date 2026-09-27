@@ -46,7 +46,7 @@ interface BlockerDao {
     @Query("SELECT * FROM DailyUsage WHERE date >= :fromDate")
     fun observeUsageSince(fromDate: String): Flow<List<DailyUsage>>
 
-    @Upsert suspend fun upsertUsage(u: DailyUsage)
+    @Upsert suspend fun upsertUsage(u: List<DailyUsage>)
 
     @Query("DELETE FROM DailyUsage WHERE date < :date")
     suspend fun pruneUsage(date: String)

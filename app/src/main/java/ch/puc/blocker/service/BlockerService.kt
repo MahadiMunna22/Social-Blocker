@@ -1,14 +1,20 @@
 package ch.puc.blocker.service
 
+import android.app.ActivityManager
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.usage.UsageEvents
 import android.app.usage.UsageStatsManager
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.content.pm.ServiceInfo
+import android.media.AudioAttributes
+import android.media.AudioFocusRequest
+import android.media.AudioManager
 import android.os.Build
 import android.os.PowerManager
 import android.util.Log
@@ -27,31 +33,52 @@ import ch.puc.blocker.domain.Decision
 import ch.puc.blocker.domain.FgEvent
 import ch.puc.blocker.domain.Remaining
 import ch.puc.blocker.domain.RuleEngine
+import ch.puc.blocker.domain.StatusText
 import ch.puc.blocker.domain.UsageAggregator
 import ch.puc.blocker.domain.UsageState
 import ch.puc.blocker.overlay.BlockOverlay
 import ch.puc.blocker.overlay.TimerOverlay
+import ch.puc.blocker.overlay.goHome
 import ch.puc.blocker.ruleConfig
 import ch.puc.blocker.ui.MainActivity
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.time.LocalTime
 
-/** Polls UsageStatsManager every second, applies the rules and shows the overlay. */
+/**
+ * Polls UsageStatsManager every second while the screen is on, applies the rules, closes blocked
+ * apps and keeps the ongoing notification up to date. It sleeps while the screen is off.
+ */
 class BlockerService : LifecycleService() {
 
     companion object {
+        /** Day changed (midnight): save counters, then reload them for the new date. */
         const val ACTION_REFRESH = "ch.puc.blocker.REFRESH"
+        /** Only re-post the ongoing notification, e.g. to clear a notification reply spinner. */
+        const val ACTION_REFRESH_NOTIFICATION = "ch.puc.blocker.REFRESH_NOTIFICATION"
         private const val CHANNEL = "blocker"
         private const val CHANNEL_UNLOCK = "unlock"
+        private const val ID_STATUS = 1
         private const val ID_UNLOCK = 2
         private const val TAG = "BlockerService"
+        private const val FLUSH_MS = 15_000L
+        private const val SYSTEM_SYNC_MS = 60_000L
+        /** Don't re-send the same app home while the launcher is still coming up. */
+        private const val ENFORCE_RETRY_MS = 3_000L
 
         /** True while the service is alive; shown in the UI as a health indicator. */
         @Volatile var running = false
             private set
+
+        fun channels() = listOf(
+            NotificationChannel(CHANNEL, "Blocker", NotificationManager.IMPORTANCE_LOW),
+            NotificationChannel(CHANNEL_UNLOCK, "Unlock ready", NotificationManager.IMPORTANCE_DEFAULT),
+        )
 
         fun start(context: Context, action: String? = null) {
             try {
@@ -64,36 +91,59 @@ class BlockerService : LifecycleService() {
 
     private val dao by lazy { (application as BlockerApp).db.dao() }
     private val usm by lazy { getSystemService(UsageStatsManager::class.java) }
-    private val pm by lazy { getSystemService(PowerManager::class.java) }
+    private val nm by lazy { getSystemService(NotificationManager::class.java) }
     private lateinit var overlay: BlockOverlay
     private lateinit var timer: TimerOverlay
 
     // Kept fresh by Room flows, so edits apply without restarting.
     @Volatile private var apps: Map<String, TrackedApp> = emptyMap()
     @Volatile private var settings: GlobalSettings? = null
-    @Volatile private var waitReadyAt = 0L
-    /** Open tasks, for the periodic reminder. */
+    /** Open tasks, for the notification and the periodic reminder. */
     @Volatile private var openTasks: List<TaskItem> = emptyList()
     private var lastReminder = System.currentTimeMillis()
     /** Package → end of its redeemed task reward. */
     @Volatile private var rewards: Map<String, Long> = emptyMap()
-    private var waitNotified = false
+
+    /** Screen on/off, pushed by [screenReceiver] so the loop can sleep instead of polling. */
+    private val interactive = MutableStateFlow(true)
+    private val screenReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            interactive.value = intent.action != Intent.ACTION_SCREEN_OFF
+        }
+    }
 
     private var loop: Job? = null
     private var day = ""
+    private var reloadDay = false
     private var firstUnlock: Long? = null
     private val usage = mutableMapOf<String, UsageState>()
+    /** Packages whose [usage] changed since the last write to Room. */
+    private val dirty = mutableSetOf<String>()
+    private var lastFlush = 0L
     private var fgPackage: String? = null
     private var lastEventQuery = 0L
     private var lastTick = 0L
     private var lastSystemSync = 0L
 
+    /** Block card currently on screen (label to block); stays over the home screen until dismissed. */
+    private var shownBlock: Pair<String, Decision.Block>? = null
+    private var enforcedPkg: String? = null
+    private var enforcedAt = 0L
+
+    private var lastStatus = ""
+    private var lastNotification: Notification? = null
+
     override fun onCreate() {
         super.onCreate()
         running = true
-        overlay = BlockOverlay(this)
+        overlay = BlockOverlay(this) { shownBlock = null }
         timer = TimerOverlay(this)
         startInForeground()
+        interactive.value = getSystemService(PowerManager::class.java).isInteractive
+        registerReceiver(screenReceiver, IntentFilter().apply {
+            addAction(Intent.ACTION_SCREEN_ON)
+            addAction(Intent.ACTION_SCREEN_OFF)
+        }, RECEIVER_NOT_EXPORTED)
         lifecycleScope.launch { dao.observeApps().collect { list -> apps = list.filter { it.enabled }.associateBy { it.packageName }; lastSystemSync = 0 } }
         lifecycleScope.launch { dao.observeSettings().collect { settings = it } }
         lifecycleScope.launch {
@@ -104,20 +154,27 @@ class BlockerService : LifecycleService() {
                 rewards = list.groupBy { it.packageName }.mapValues { (_, v) -> v.maxOf { it.untilMs } }
             }
         }
+        // One timed wake-up per pending wait instead of checking it every tick.
         lifecycleScope.launch {
-            dao.observeWait().collect {
-                waitReadyAt = it?.readyAtMs ?: 0
-                waitNotified = false
-                if (it == null) getSystemService(NotificationManager::class.java).cancel(ID_UNLOCK)
+            dao.observeWait().collectLatest { w ->
+                if (w == null) { nm.cancel(ID_UNLOCK); return@collectLatest }
+                delay((w.readyAtMs - System.currentTimeMillis()).coerceAtLeast(0))
+                notifyUnlockReady()
             }
         }
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         super.onStartCommand(intent, flags, startId)
-        if (intent?.action == ACTION_REFRESH) { day = ""; lastStatus = "" } // reload counters, re-post notification
+        // Every startForegroundService() must be answered with startForeground(), even when already running.
+        startInForeground()
+        when (intent?.action) {
+            ACTION_REFRESH -> { reloadDay = true; lastStatus = "" }
+            ACTION_REFRESH_NOTIFICATION -> lastStatus = ""
+        }
         if (loop == null) loop = lifecycleScope.launch {
             while (isActive) {
+                if (!interactive.value) sleepUntilScreenOn()
                 runCatching { tick() }.onFailure { Log.e(TAG, "tick failed", it) }
                 delay(1_000)
             }
@@ -127,19 +184,34 @@ class BlockerService : LifecycleService() {
 
     override fun onDestroy() {
         running = false
+        runCatching { unregisterReceiver(screenReceiver) }
         hideAll()
+        // lifecycleScope is cancelled from here on, so hand the last write to the app scope.
+        val pending = takeDirty()
+        if (pending.isNotEmpty()) (application as BlockerApp).scope.launch { dao.upsertUsage(pending) }
         super.onDestroy()
+    }
+
+    private suspend fun sleepUntilScreenOn() {
+        hideAll()
+        shownBlock = null
+        flush()
+        interactive.first { it }
+        lastTick = 0 // no time passes in a tracked app while the screen is off
+        lastSystemSync = 0 // catch up on anything used while we slept
     }
 
     private suspend fun tick() {
         val now = System.currentTimeMillis()
         val today = Day.today()
-        if (today != day) loadDay(today, now)
+        if (today != day || reloadDay) {
+            flush() // saved under the old date
+            reloadDay = false
+            loadDay(today)
+        }
 
         val delta = if (lastTick == 0L) 0 else (now - lastTick).coerceIn(0, 2_000)
         lastTick = now
-        if (waitReadyAt in 1..now && !waitNotified) { waitNotified = true; notifyUnlockReady() }
-        if (!pm.isInteractive) { hideAll(); return }
         // Every 3 h between 9:00 and 21:59, nudge about open tasks while the phone is in use.
         if (openTasks.isNotEmpty() && now - lastReminder >= 3 * 60 * 60_000L && LocalTime.now().hour in 9..21) {
             lastReminder = now
@@ -150,46 +222,92 @@ class BlockerService : LifecycleService() {
             firstUnlock = now
             dao.insertDayState(DayState(today, now))
         }
+        val previousFg = fgPackage
         updateForeground(now)
-        if (now - lastSystemSync >= 60_000) syncSystemUsage(today, now)
+        if (fgPackage != previousFg) flush()
 
         val s = settings ?: return
-        val pkg = fgPackage
-        val app = pkg?.let { apps[it] }
-        if (!s.blockingEnabled || app == null) {
+        val app = fgPackage?.let { apps[it] }
+        // Full-day scan only when it can matter: on (re)start, after screen-on and while a tracked app is open.
+        if (lastSystemSync == 0L || (app != null && now - lastSystemSync >= SYSTEM_SYNC_MS)) syncSystemUsage(now)
+
+        if (!s.blockingEnabled) {
             hideAll()
-            status(if (!s.blockingEnabled) "Blocking paused" else "Watching ${apps.size} app(s)")
+            shownBlock = null
+            status("Blocking paused", now, s, inUse = null)
             return
         }
 
-        // An earned task reward lifts every limit for this app; that time isn't counted.
-        val rewardUntil = rewards[pkg] ?: 0
-        if (now < rewardUntil) {
-            overlay.hide()
-            timer.show(app.label, Remaining(rewardUntil - now, dailyLimited = false), reward = true)
-            status("${app.label}: reward unlock active")
-            return
-        }
-
-        val cfg = ruleConfig(app, s)
-        val endOfDay = Day.startOfTomorrowMs()
-        var state = usage[pkg] ?: UsageState()
-        var decision = RuleEngine.evaluate(now, firstUnlock, endOfDay, cfg, state)
-        if (decision == Decision.Allow) {
-            state = RuleEngine.accrue(state, now, delta, cfg)
-            usage[pkg] = state
-            dao.upsertUsage(DailyUsage(today, pkg, state.totalMs, state.sessionMs, state.lastSeenMs, state.cooldownUntilMs))
-            decision = RuleEngine.evaluate(now, firstUnlock, endOfDay, cfg, state)
-        }
-        if (decision is Decision.Block) {
-            // Time's up: drop the countdown and cover the app until the rule expires.
+        var inUse: String? = null
+        if (app == null) {
             timer.hide()
-            overlay.show(app.label, decision)
-            status("${app.label} is blocked")
         } else {
-            overlay.hide()
-            timer.show(app.label, RuleEngine.remaining(cfg, state))
-            status("${app.label}: ${((cfg.dailyCapMs - state.totalMs) / 60_000).coerceAtLeast(0)} min left today")
+            val pkg = app.packageName
+            val rewardUntil = rewards[pkg] ?: 0
+            if (now < rewardUntil) {
+                // An earned task reward lifts every limit for this app; that time isn't counted.
+                shownBlock = null
+                overlay.hide()
+                timer.show(app.label, Remaining(rewardUntil - now, dailyLimited = false), reward = true)
+                inUse = StatusText.reward(app.label, rewardUntil - now)
+            } else {
+                val cfg = ruleConfig(app, s)
+                var state = usage[pkg] ?: UsageState()
+                var decision = RuleEngine.evaluate(now, firstUnlock, Day.startOfTomorrowMs(), cfg, state)
+                if (decision == Decision.Allow) {
+                    val next = RuleEngine.accrue(state, now, delta, cfg)
+                    usage[pkg] = next
+                    dirty += pkg
+                    if (next.cooldownUntilMs != state.cooldownUntilMs) flush() // a cooldown must survive a restart
+                    state = next
+                    decision = RuleEngine.evaluate(now, firstUnlock, Day.startOfTomorrowMs(), cfg, state)
+                }
+                if (decision is Decision.Block) {
+                    timer.hide()
+                    enforceBlock(app, decision, now)
+                } else {
+                    shownBlock = null
+                    overlay.hide()
+                    val r = RuleEngine.remaining(cfg, state)
+                    timer.show(app.label, r)
+                    inUse = StatusText.inUse(app.label, r)
+                }
+            }
+        }
+
+        // Keep the block card (now over the home screen) counting down until dismissed or expired.
+        shownBlock?.let { (label, block) -> if (now >= block.untilMs) { shownBlock = null; overlay.hide() } else overlay.show(label, block) }
+        if (now - lastFlush >= FLUSH_MS) flush()
+        status(null, now, s, inUse)
+    }
+
+    /**
+     * Closes a blocked app: show the block card, send the user home, pause its media and kill its process.
+     * The card goes up first because Android 15+ only lets an overlay app start the launcher while its window is visible.
+     */
+    private fun enforceBlock(app: TrackedApp, block: Decision.Block, now: Long) {
+        shownBlock = app.label to block
+        overlay.show(app.label, block)
+        if (app.packageName == enforcedPkg && now - enforcedAt < ENFORCE_RETRY_MS) return
+        enforcedPkg = app.packageName
+        enforcedAt = now
+        runCatching { goHome() }.onFailure { Log.w(TAG, "Could not open home screen", it) }
+        stopPlayback()
+        lifecycleScope.launch {
+            delay(800) // the app must be in the background before it can be killed
+            // Works up to Android 13; from 14 on Android only allows this for our own app, so going home is the close.
+            runCatching { getSystemService(ActivityManager::class.java).killBackgroundProcesses(app.packageName) }
+        }
+    }
+
+    /** Taking audio focus makes well-behaved apps pause their video or audio; we hand it back right away. */
+    private fun stopPlayback() {
+        val am = getSystemService(AudioManager::class.java)
+        val request = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN)
+            .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).build())
+            .build()
+        if (am.requestAudioFocus(request) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED) {
+            lifecycleScope.launch { delay(500); am.abandonAudioFocusRequest(request) }
         }
     }
 
@@ -198,13 +316,30 @@ class BlockerService : LifecycleService() {
         timer.hide()
     }
 
-    private suspend fun loadDay(today: String, now: Long) {
+    private fun takeDirty(): List<DailyUsage> {
+        if (day.isEmpty() || dirty.isEmpty()) return emptyList()
+        val rows = dirty.mapNotNull { pkg ->
+            usage[pkg]?.let { DailyUsage(day, pkg, it.totalMs, it.sessionMs, it.lastSeenMs, it.cooldownUntilMs) }
+        }
+        dirty.clear()
+        return rows
+    }
+
+    /** Writes changed counters in one transaction instead of every second. */
+    private suspend fun flush() {
+        lastFlush = System.currentTimeMillis()
+        val rows = takeDirty()
+        if (rows.isNotEmpty()) dao.upsertUsage(rows)
+    }
+
+    private suspend fun loadDay(today: String) {
         day = today
         lastSystemSync = 0
         usage.clear()
+        dirty.clear()
         dao.usage(today).forEach { usage[it.packageName] = UsageState(it.totalMs, it.sessionMs, it.lastSeenMs, it.cooldownUntilMs) }
         firstUnlock = dao.dayState(today)?.firstUnlockMs
-            ?: firstUnlockSince(Day.startOfTodayMs(), now)?.also { dao.insertDayState(DayState(today, it)) }
+            ?: firstUnlockSince(Day.startOfTodayMs(), System.currentTimeMillis())?.also { dao.insertDayState(DayState(today, it)) }
     }
 
     /**
@@ -212,7 +347,7 @@ class BlockerService : LifecycleService() {
      * Wellbeing shows, and raises our counter if the system saw more. That covers time used before
      * the app was installed or while the service was stopped.
      */
-    private suspend fun syncSystemUsage(today: String, now: Long) {
+    private fun syncSystemUsage(now: Long) {
         lastSystemSync = now
         val tracked = apps.keys
         if (tracked.isEmpty()) return
@@ -229,9 +364,8 @@ class BlockerService : LifecycleService() {
         UsageAggregator.foregroundMs(events, Day.startOfTodayMs(), now).forEach { (pkg, systemMs) ->
             val cur = usage[pkg] ?: UsageState()
             if (systemMs > cur.totalMs) {
-                val next = cur.copy(totalMs = systemMs)
-                usage[pkg] = next
-                dao.upsertUsage(DailyUsage(today, pkg, next.totalMs, next.sessionMs, next.lastSeenMs, next.cooldownUntilMs))
+                usage[pkg] = cur.copy(totalMs = systemMs)
+                dirty += pkg
             }
         }
     }
@@ -256,31 +390,58 @@ class BlockerService : LifecycleService() {
         }
     }
 
-    private var lastStatus = ""
-
-    /** Updates the ongoing notification only when the text actually changes. */
-    private fun status(text: String) {
-        if (text == lastStatus) return
-        lastStatus = text
-        getSystemService(NotificationManager::class.java).notify(1, notification(text))
+    /** Apps blocked right now, soonest unblock first. Rewarded apps are free, so they're left out. */
+    private fun blockedApps(now: Long, s: GlobalSettings): List<StatusText.Blocked> {
+        val endOfDay = Day.startOfTomorrowMs()
+        return apps.values.mapNotNull { app ->
+            if (now < (rewards[app.packageName] ?: 0)) return@mapNotNull null
+            val d = RuleEngine.evaluate(now, firstUnlock, endOfDay, ruleConfig(app, s), usage[app.packageName] ?: UsageState())
+            (d as? Decision.Block)?.let { StatusText.Blocked(app.label, it.reason, it.untilMs) }
+        }.sortedBy { it.untilMs }
     }
 
-    private fun notification(text: String): Notification {
+    /**
+     * Ongoing notification. Title: the app in use, else which apps are blocked and for how long.
+     * Text: the next task. Expanded: every blocked app, then every open task.
+     * Only re-posted when the wording changes, so about once a minute.
+     */
+    private fun status(override: String?, now: Long, s: GlobalSettings, inUse: String?) {
+        val blocked = if (s.blockingEnabled) blockedApps(now, s) else emptyList()
+        val title = override ?: inUse ?: StatusText.headline(blocked, now)
+        val tasks = openTasks.sortedWith(compareBy({ it.dueEpochDay }, { it.createdMs }))
+        val text = TaskNotifications.nextLine(tasks) ?: "No open tasks"
+        val lines = buildList {
+            blocked.forEach { add(StatusText.blockedLine(it, now)) }
+            if (tasks.isEmpty()) add("No open tasks. Tap ➕ to add one.")
+            else {
+                add("${TaskNotifications.headline(tasks)}:")
+                tasks.forEach { add(TaskNotifications.line(it)) }
+            }
+        }
+        val key = "$title\n$text\n${lines.joinToString("\n")}"
+        if (key == lastStatus) return
+        lastStatus = key
+        nm.notify(ID_STATUS, notification(title, text, lines))
+    }
+
+    private fun notification(title: String, text: String, lines: List<String> = emptyList()): Notification {
         val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
         return Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_notification)
-            .setContentTitle("Social limits active")
+            .setContentTitle(title)
             .setContentText(text)
+            .apply { if (lines.isNotEmpty()) style = Notification.BigTextStyle().setBigContentTitle(title).bigText(lines.joinToString("\n")) }
             .setContentIntent(open)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
             .addAction(TaskNotifications.addAction(this))
             .build()
+            .also { lastNotification = it }
     }
 
     private fun notifyUnlockReady() {
         val open = PendingIntent.getActivity(this, 1, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
-        getSystemService(NotificationManager::class.java).notify(ID_UNLOCK, Notification.Builder(this, CHANNEL_UNLOCK)
+        nm.notify(ID_UNLOCK, Notification.Builder(this, CHANNEL_UNLOCK)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle("Settings ready to unlock")
             .setContentText("Your wait is over. Open Social Blocker within 15 minutes to make changes.")
@@ -290,12 +451,9 @@ class BlockerService : LifecycleService() {
     }
 
     private fun startInForeground() {
-        val nm = getSystemService(NotificationManager::class.java)
-        nm.createNotificationChannel(NotificationChannel(CHANNEL, "Blocker", NotificationManager.IMPORTANCE_LOW))
-        nm.createNotificationChannel(NotificationChannel(CHANNEL_UNLOCK, "Unlock ready", NotificationManager.IMPORTANCE_DEFAULT))
-        val notification = notification("Starting…")
+        val notification = lastNotification ?: notification("Social limits active", "Starting…")
         // specialUse exists from API 34; on Android 13 no type is required.
         val type = if (Build.VERSION.SDK_INT >= 34) ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE else 0
-        ServiceCompat.startForeground(this, 1, notification, type)
+        ServiceCompat.startForeground(this, ID_STATUS, notification, type)
     }
 }

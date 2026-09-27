@@ -19,12 +19,13 @@ import java.text.DateFormat
 import java.util.Date
 
 /**
- * Full-screen TYPE_APPLICATION_OVERLAY window drawn over a blocked app.
+ * Full-screen TYPE_APPLICATION_OVERLAY card explaining a block. The service closes the blocked app
+ * and shows this over the home screen until "OK" ([onDismiss]) or the block ends.
  * The service calls [show] every tick, which keeps the countdown live.
  * Plain Views keep it free of the lifecycle plumbing a ComposeView needs inside a Service.
  */
 @SuppressLint("SetTextI18n")
-class BlockOverlay(private val context: Context) {
+class BlockOverlay(private val context: Context, private val onDismiss: () -> Unit = {}) {
     private val wm = context.getSystemService(WindowManager::class.java)
     private var root: LinearLayout? = null
     private lateinit var title: TextView
@@ -53,15 +54,15 @@ class BlockOverlay(private val context: Context) {
             Reason.DAILY_CAP -> "That's enough for today"
         }
         detail.text = when (block.reason) {
-            Reason.MORNING -> "$appLabel is locked for the first part of your day.\nUnlocks at $until."
-            Reason.COOLDOWN -> "You've hit your session limit for $appLabel.\nIt unlocks again at $until."
-            Reason.DAILY_CAP -> "You've used your daily time for $appLabel.\nIt resets at midnight."
+            Reason.MORNING -> "$appLabel is locked for the first part of your day, so it was closed.\nUnlocks at $until."
+            Reason.COOLDOWN -> "You've hit your session limit for $appLabel, so it was closed.\nIt unlocks again at $until."
+            Reason.DAILY_CAP -> "You've used your daily time for $appLabel, so it was closed.\nIt resets at midnight."
         }
         countdown.text = format(block.untilMs - System.currentTimeMillis())
     }
 
     fun hide() {
-        root?.let { wm.removeView(it) }
+        root?.let { runCatching { wm.removeView(it) } }
         root = null
     }
 
@@ -90,18 +91,14 @@ class BlockOverlay(private val context: Context) {
         detail = text(16f, Color.rgb(210, 210, 225)).also { gap(it, 24) }
         quote = text(14f, Color.rgb(150, 150, 170)).apply { setTypeface(typeface, Typeface.ITALIC) }.also { gap(it, 48) }
         gap(Button(context).apply {
-            text = "Go to home screen"
+            text = "OK"
             isAllCaps = false
             setTextColor(Color.WHITE)
             background = GradientDrawable().apply { cornerRadius = 64f; setColor(Color.rgb(98, 84, 220)) }
             setPadding(72, 32, 72, 32)
-            setOnClickListener { goHome() }
+            setOnClickListener { hide(); onDismiss() }
         }, 56)
     }
-
-    private fun goHome() = context.startActivity(
-        Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
-    )
 
     private fun params() = WindowManager.LayoutParams(
         WindowManager.LayoutParams.MATCH_PARENT,
@@ -111,3 +108,8 @@ class BlockOverlay(private val context: Context) {
         PixelFormat.OPAQUE,
     )
 }
+
+/** Sends the user to the launcher, which moves whatever app is open to the background. */
+fun Context.goHome() = startActivity(
+    Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_HOME).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK),
+)
