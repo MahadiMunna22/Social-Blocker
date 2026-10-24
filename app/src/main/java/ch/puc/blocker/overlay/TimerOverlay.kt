@@ -53,7 +53,13 @@ class TimerOverlay(private val context: Context) {
         val clock = if (s >= 3600) "%d:%02d:%02d".format(s / 3600, s % 3600 / 60, s % 60) else "%d:%02d".format(s / 60, s % 60)
         val expanded = System.currentTimeMillis() < expandedUntil
         val note = when { reward -> "reward left"; r.dailyLimited -> "left today"; else -> "until break" }
-        v.text = (if (reward) "🎁 " else "") + if (expanded) "$clock $note" else clock
+        // Last 10 s: a bigger "closing" countdown so the app's closing doesn't come as a surprise.
+        val closing = !reward && s <= 10
+        v.textSize = if (closing) 20f else 13f
+        v.text = when {
+            closing -> "⏳ ${appLabel.take(16)} closes in ${s}s"
+            else -> (if (reward) "🎁 " else "") + if (expanded) "$clock $note" else clock
+        }
         v.contentDescription = "$appLabel: $clock remaining"
         bg.setColor(
             when {
@@ -63,7 +69,8 @@ class TimerOverlay(private val context: Context) {
                 else -> Color.argb(215, 17, 17, 17)
             },
         )
-        if (expanded != (v.tag == true)) { v.tag = expanded; v.post { snap(v) } } // width changed: stay on the edge
+        val wide = expanded || closing
+        if (wide != (v.tag == true)) { v.tag = wide; v.post { snap(v) } } // width changed: stay on the edge
     }
 
     fun hide() {

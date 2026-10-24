@@ -44,7 +44,6 @@ import androidx.compose.material3.Slider
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberModalBottomSheetState
-import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Switch
 import androidx.compose.material.icons.filled.Add
@@ -73,6 +72,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import ch.puc.blocker.data.TrackedApp
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import ch.puc.blocker.domain.PlayLink
 
 // ---------- App icons ----------
 
@@ -107,14 +107,14 @@ fun AppIcon(packageName: String, label: String = packageName, size: Dp = 40.dp) 
 
 @Composable
 internal fun ValueSlider(label: String, value: Int, range: IntRange, step: Int, unit: String, enabled: Boolean = true, onChange: (Int) -> Unit) {
-    Column(Modifier.padding(vertical = 4.dp)) {
+    Column(Modifier.padding(vertical = 2.dp)) {
         Row {
-            Text(label, Modifier.weight(1f))
-            Text("$value $unit", fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary)
+            Text(label, Modifier.weight(1f), style = MaterialTheme.typography.bodyMedium)
+            Text("$value $unit".trim(), fontWeight = FontWeight.Bold, color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.bodyMedium)
         }
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            FilledTonalIconButton(onClick = { onChange((value - step).coerceIn(range)) }, enabled = enabled && value > range.first) {
-                Text("−", fontSize = 20.sp)
+        Row(Modifier.height(40.dp), verticalAlignment = Alignment.CenterVertically) {
+            FilledTonalIconButton(onClick = { onChange((value - step).coerceIn(range)) }, enabled = enabled && value > range.first, modifier = Modifier.size(32.dp)) {
+                Text("−", fontSize = 18.sp)
             }
             Slider(
                 value = value.toFloat(),
@@ -124,8 +124,8 @@ internal fun ValueSlider(label: String, value: Int, range: IntRange, step: Int, 
                 enabled = enabled,
                 modifier = Modifier.weight(1f).padding(horizontal = 8.dp),
             )
-            FilledTonalIconButton(onClick = { onChange((value + step).coerceIn(range)) }, enabled = enabled && value < range.last) {
-                Text("+", fontSize = 20.sp)
+            FilledTonalIconButton(onClick = { onChange((value + step).coerceIn(range)) }, enabled = enabled && value < range.last, modifier = Modifier.size(32.dp)) {
+                Text("+", fontSize = 18.sp)
             }
         }
     }
@@ -136,17 +136,20 @@ internal fun ValueSlider(label: String, value: Int, range: IntRange, step: Int, 
 private fun LimitsEditor(limits: Limits, appName: String, enabled: Boolean = true, onChange: (Limits) -> Unit) {
     Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
         Limits.presets.forEach { (name, preset) ->
-            FilterChip(limits == preset, { onChange(preset) }, label = { Text(name) }, enabled = enabled)
+            // Presets set the timers only; the opens limit is kept.
+            FilterChip(limits.copy(opens = 0) == preset, { onChange(preset.copy(opens = limits.opens)) }, label = { Text(name) }, enabled = enabled)
         }
     }
     Spacer(Modifier.height(8.dp))
     ValueSlider("⏱ Session timer", limits.session, 1..60, 1, "min", enabled) { onChange(limits.copy(session = it)) }
     ValueSlider("☕ Break after session", limits.cooldown, 5..120, 5, "min", enabled) { onChange(limits.copy(cooldown = it)) }
     ValueSlider("📅 Daily limit", limits.cap, 5..240, 5, "min", enabled) { onChange(limits.copy(cap = it)) }
+    ValueSlider("🚪 Opens per day (0 = no limit)", limits.opens, 0..30, 1, "", enabled) { onChange(limits.copy(opens = it)) }
     Card(Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
         Text(
             "A timer counts down while you use $appName. After ${limits.session} min it takes a ${limits.cooldown} min break, " +
-                "and after ${limits.cap} min in total it's blocked until tomorrow.",
+                "and after ${limits.cap} min in total it's blocked until tomorrow." +
+                    if (limits.opens > 0) " It can be opened ${limits.opens} times a day." else "",
             Modifier.padding(12.dp), style = MaterialTheme.typography.bodySmall,
         )
     }
@@ -157,7 +160,7 @@ private fun LimitsEditor(limits: Limits, appName: String, enabled: Boolean = tru
 @Composable
 internal fun AddMoreCard(first: Boolean, onAdd: () -> Unit) {
     Row(
-        Modifier.fillMaxWidth().background(AccentSoft.copy(alpha = if (isSystemInDarkTheme()) 0.12f else 1f), RoundedCornerShape(24.dp))
+        Modifier.fillMaxWidth().background(AccentSoft.copy(alpha = if (isDarkLook) 0.5f else 1f), RoundedCornerShape(24.dp))
             .clickable(onClick = onAdd).padding(20.dp),
         verticalAlignment = Alignment.CenterVertically,
     ) {
@@ -193,7 +196,7 @@ internal fun AppSheet(app: TrackedApp, vm: SettingsViewModel, onDismiss: () -> U
                 AppIcon(app.packageName, app.label, 56.dp)
                 Column(Modifier.weight(1f).padding(start = 12.dp)) {
                     Text(app.label, style = MaterialTheme.typography.titleLarge)
-                    Text(if (app.enabled) "Limits on" else "Not limited", style = MaterialTheme.typography.bodySmall,
+                    Text(when { !app.enabled -> "Not limited"; app.banned -> "Can't be installed"; else -> "Limits on" }, style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
                 // Turning on is instant; turning off asks for the unlock.
@@ -201,12 +204,12 @@ internal fun AppSheet(app: TrackedApp, vm: SettingsViewModel, onDismiss: () -> U
             }
             if (!unlocked) LockedHint(unlock)
             Spacer(Modifier.height(8.dp))
-            LimitsEditor(limits, app.label, enabled = unlocked) { limits = it }
+            if (!app.banned) LimitsEditor(limits, app.label, enabled = unlocked) { limits = it }
             if (unlocked) Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 TextButton(onClick = { confirmRemove = true }) { Text("Remove app", color = Danger) }
                 Spacer(Modifier.weight(1f))
-                PillButton("Save", enabled = limits != app.limits()) {
-                    vm.updateApp(app, app.copy(sessionLimitMin = limits.session, cooldownMin = limits.cooldown, dailyCapMin = limits.cap))
+                if (!app.banned) PillButton("Save", enabled = limits != app.limits()) {
+                    vm.updateApp(app, app.copy(sessionLimitMin = limits.session, cooldownMin = limits.cooldown, dailyCapMin = limits.cap, opensPerDay = limits.opens))
                     onDismiss()
                 }
             }
@@ -215,8 +218,8 @@ internal fun AppSheet(app: TrackedApp, vm: SettingsViewModel, onDismiss: () -> U
     if (confirmRemove) AlertDialog(
         onDismissRequest = { confirmRemove = false },
         icon = { AppIcon(app.packageName, app.label) },
-        title = { Text("Stop limiting ${app.label}?") },
-        text = { Text("Its timers will no longer apply.") },
+        title = { Text(if (app.banned) "Allow installing ${app.label}?" else "Stop limiting ${app.label}?") },
+        text = { Text(if (app.banned) "It will no longer be blocked." else "Its timers will no longer apply.") },
         confirmButton = { TextButton(onClick = { vm.removeApp(app); confirmRemove = false; onDismiss() }) { Text("Remove") } },
         dismissButton = { TextButton(onClick = { confirmRemove = false }) { Text("Cancel") } },
     )
@@ -241,14 +244,18 @@ internal fun AppPickerSheet(vm: SettingsViewModel, onDismiss: () -> Unit) {
                     Text("Choose apps to limit", style = MaterialTheme.typography.titleLarge)
                     OutlinedTextField(
                         query, { query = it }, Modifier.fillMaxWidth().padding(vertical = 8.dp),
-                        placeholder = { Text("Search apps") }, leadingIcon = { Icon(Icons.Default.Search, null) }, singleLine = true,
+                        placeholder = { Text("Search apps, or paste a Play Store link") }, leadingIcon = { Icon(Icons.Default.Search, null) }, singleLine = true,
                     )
                     val list = all
                     if (list == null) {
                         Text("Loading apps…", Modifier.padding(24.dp))
                     } else {
-                        val shown = list.filter { query.isBlank() || it.label.contains(query, true) }
+                        val matches = list.filter { query.isBlank() || it.label.contains(query, true) || it.packageName == query.trim() }
+                        val shown = matches.filter { it.installed }
                         val suggested = shown.filter { it.suggested }
+                        // Not installed: popular apps, plus whatever package a pasted Play Store link names.
+                        val typed = PlayLink.packageName(query)?.takeIf { p -> list.none { it.packageName == p } && vm.rows.value.none { it.app.packageName == p } }
+                        val notInstalled = matches.filterNot { it.installed } + listOfNotNull(typed?.let { Candidate(it, it, false, installed = false) })
                         LazyVerticalGrid(
                             GridCells.Adaptive(80.dp), Modifier.fillMaxWidth().height(440.dp),
                             contentPadding = PaddingValues(vertical = 4.dp),
@@ -259,12 +266,31 @@ internal fun AppPickerSheet(vm: SettingsViewModel, onDismiss: () -> Unit) {
                                 item(span = { GridItemSpan(maxLineSpan) }) { SectionLabel("All apps") }
                             }
                             items(shown.filterNot { it.suggested }, key = { it.packageName }) { AppTile(it, it in picked, toggle) }
+                            if (notInstalled.isNotEmpty()) {
+                                item(span = { GridItemSpan(maxLineSpan) }) {
+                                    Column {
+                                        SectionLabel("Not installed: block installing")
+                                        Text("Always blocked and you're asked to uninstall it if it gets installed. Removing it needs the unlock.",
+                                            style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                                    }
+                                }
+                                items(notInstalled, key = { "n" + it.packageName }) { AppTile(it, it in picked, toggle) }
+                            }
                         }
                     }
+                    // Only installed apps need timers; a pure "can't install" pick is added straight away.
+                    val onlyBanned = picked.isNotEmpty() && picked.none { it.installed }
                     Button(
-                        onClick = { step = 1 }, enabled = picked.isNotEmpty(),
+                        onClick = { if (onlyBanned) { vm.addApps(picked.toList(), limits); onDismiss() } else step = 1 },
+                        enabled = picked.isNotEmpty(),
                         modifier = Modifier.fillMaxWidth().padding(vertical = 16.dp).height(52.dp),
-                    ) { Text(if (picked.isEmpty()) "Tap apps to select them" else "Next: set timers (${picked.size})") }
+                    ) {
+                        Text(when {
+                            picked.isEmpty() -> "Tap apps to select them"
+                            onlyBanned -> "Block installing ${picked.size} app(s)"
+                            else -> "Next: set timers (${picked.size})"
+                        })
+                    }
                 } else {
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         IconButton(onClick = { step = 0 }) { Icon(Icons.AutoMirrored.Filled.ArrowBack, "Back") }

@@ -8,7 +8,7 @@ object StatusText {
     fun minutesLeft(ms: Long): Long = ((ms + 59_999) / 60_000).coerceAtLeast(0)
 
     fun timeLeft(b: Blocked, now: Long): String =
-        if (b.reason == Reason.DAILY_CAP) "until midnight" else "${minutesLeft(b.untilMs - now)} min"
+        if (b.reason == Reason.BANNED) "not allowed" else if (b.reason == Reason.DAILY_CAP || b.reason == Reason.OPENS) "until midnight" else "${minutesLeft(b.untilMs - now)} min"
 
     /** "No apps blocked", "Instagram blocked · 23 min" or "Instagram 23 min · TikTok until midnight". */
     fun headline(blocked: List<Blocked>, now: Long): String = when (blocked.size) {

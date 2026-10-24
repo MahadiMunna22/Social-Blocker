@@ -1,5 +1,6 @@
 package ch.puc.blocker.ui
 
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.animation.core.FastOutSlowInEasing
 import androidx.compose.animation.core.animateFloatAsState
@@ -44,81 +45,136 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.graphics.lerp
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.material3.ColorScheme
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.staticCompositionLocalOf
 
-// Palette: lavender canvas, white cards, black actions, purple accent.
-val Accent = Color(0xFF7C4DFF)
-val AccentSoft = Color(0xFFEDE7FF)
-val Danger = Color(0xFFE0457B)
+/**
+ * Accent colours. Every one uses the same frosted look (backdrop, glass cards and bar); only the accent changes.
+ * The order keeps older saved ordinals meaningful: Classic was purple, iOS blue, Material You → pink, Calm green, Graphite orange.
+ */
+enum class AppTheme(val label: String, val dark: Color, val light: Color) {
+    PURPLE("Purple", Color(0xFFA78BFA), Color(0xFF7C4DFF)),
+    BLUE("Blue", Color(0xFF0A84FF), Color(0xFF007AFF)),
+    PINK("Pink", Color(0xFFFF5C93), Color(0xFFD63D73)),
+    GREEN("Green", Color(0xFF4CC38A), Color(0xFF1E9E63)),
+    ORANGE("Orange", Color(0xFFF26B1D), Color(0xFFE85D0F)),
+}
+
+enum class AppearanceMode(val label: String) { SYSTEM("System"), LIGHT("Light"), DARK("Dark") }
+
+internal val Danger = Color(0xFFE0457B)
 internal val Green = Color(0xFF22A06B)
 internal val Amber = Color(0xFFE8A200)
 
-private val Light = lightColorScheme(
-    primary = Color(0xFF111111), onPrimary = Color.White,
-    primaryContainer = AccentSoft, onPrimaryContainer = Color(0xFF2A1A66),
-    secondary = Accent, onSecondary = Color.White,
-    secondaryContainer = AccentSoft, onSecondaryContainer = Color(0xFF2A1A66),
-    tertiaryContainer = Color(0xFFFDE8F0), onTertiaryContainer = Color(0xFF5A1830),
-    background = Color(0xFFF4F3FA), onBackground = Color(0xFF111111),
-    surface = Color(0xFFF4F3FA), onSurface = Color(0xFF111111),
-    surfaceVariant = Color(0xFFECEAF4), onSurfaceVariant = Color(0xFF6B6878),
-    surfaceContainerLowest = Color.White, surfaceContainerLow = Color.White,
-    surfaceContainer = Color.White, surfaceContainerHigh = Color.White, surfaceContainerHighest = Color.White,
-    outlineVariant = Color(0xFFE6E3EF), error = Danger,
-)
+/** What a theme decides beyond Material's colour scheme. */
+private class Look(val scheme: ColorScheme, val accent: Color, val accentSoft: Color, val dark: Boolean)
 
-private val Dark = darkColorScheme(
-    primary = Color(0xFFF4F3FA), onPrimary = Color(0xFF111111),
-    primaryContainer = Color(0xFF2E2550), onPrimaryContainer = Color(0xFFE6DDFF),
-    secondary = Color(0xFFB39DFF), onSecondary = Color(0xFF1A1033),
-    secondaryContainer = Color(0xFF2E2550), onSecondaryContainer = Color(0xFFE6DDFF),
-    tertiaryContainer = Color(0xFF4A2233), onTertiaryContainer = Color(0xFFFFD9E4),
-    background = Color(0xFF121118), onBackground = Color(0xFFF4F3FA),
-    surface = Color(0xFF121118), onSurface = Color(0xFFF4F3FA),
-    surfaceVariant = Color(0xFF2A2833), onSurfaceVariant = Color(0xFFB0ADBC),
-    surfaceContainerLowest = Color(0xFF1C1B24), surfaceContainerLow = Color(0xFF1C1B24),
-    surfaceContainer = Color(0xFF1C1B24), surfaceContainerHigh = Color(0xFF1C1B24), surfaceContainerHighest = Color(0xFF1C1B24),
-    outlineVariant = Color(0xFF2E2C38), error = Danger,
-)
+private val LocalLook = staticCompositionLocalOf<Look> { error("BlockerTheme missing") }
 
-private val Serif = FontFamily.Serif
+/** Theme accent for links, highlights and the selected chart bar. */
+val Accent: Color @Composable get() = LocalLook.current.accent
+val AccentSoft: Color @Composable get() = LocalLook.current.accentSoft
+/** Dark variant in use (setting or system), for the few places that tune alpha by mode. */
+val isDarkLook: Boolean @Composable get() = LocalLook.current.dark
+
+// Graphite canvas, frosted grey cards with a light rim, accent-coloured actions (after the "Hume" smart home design).
+private fun look(theme: AppTheme, dark: Boolean): Look {
+    val a = if (dark) theme.dark else theme.light
+    return if (dark) {
+        val bg = Color(0xFF1E1E20)
+        val soft = lerp(bg, a, 0.28f)
+        Look(
+            darkColorScheme(
+                primary = a, onPrimary = Color.White,
+                primaryContainer = soft, onPrimaryContainer = lerp(a, Color.White, 0.75f),
+                secondary = a, onSecondary = Color.White,
+                secondaryContainer = soft, onSecondaryContainer = lerp(a, Color.White, 0.75f),
+                tertiaryContainer = Color(0xFF4D1F1F), onTertiaryContainer = Color(0xFFFFDAD6),
+                background = bg, onBackground = Color(0xFFF2F2F3),
+                surface = bg, onSurface = Color(0xFFF2F2F3),
+                surfaceVariant = Color(0xFF38383B), onSurfaceVariant = Color(0xFFA3A3A8),
+                surfaceContainerLowest = Color(0xFF2B2B2E), surfaceContainerLow = Color(0xFF2B2B2E),
+                surfaceContainer = Color(0xFF2B2B2E), surfaceContainerHigh = Color(0xFF333336), surfaceContainerHighest = Color(0xFF333336),
+                outlineVariant = Color(0xFF3E3E42), error = Color(0xFFFF5A4E),
+            ),
+            accent = a, accentSoft = soft, dark = true,
+        )
+    } else {
+        val soft = lerp(Color.White, a, 0.15f)
+        Look(
+            lightColorScheme(
+                primary = a, onPrimary = Color.White,
+                primaryContainer = soft, onPrimaryContainer = lerp(a, Color.Black, 0.6f),
+                secondary = a, onSecondary = Color.White,
+                secondaryContainer = soft, onSecondaryContainer = lerp(a, Color.Black, 0.6f),
+                tertiaryContainer = Color(0xFFFFE0DC), onTertiaryContainer = Color(0xFF5F0B05),
+                background = Color(0xFFE9E9EB), onBackground = Color(0xFF1C1C1E),
+                surface = Color(0xFFE9E9EB), onSurface = Color(0xFF1C1C1E),
+                surfaceVariant = Color(0xFFDADADD), onSurfaceVariant = Color(0xFF66666B),
+                surfaceContainerLowest = Color(0xFFF7F7F8), surfaceContainerLow = Color(0xFFF7F7F8),
+                surfaceContainer = Color(0xFFF7F7F8), surfaceContainerHigh = Color(0xFFF7F7F8), surfaceContainerHighest = Color(0xFFF7F7F8),
+                outlineVariant = Color(0xFFD3D3D6), error = Color(0xFFE5392C),
+            ),
+            accent = a, accentSoft = soft, dark = false,
+        )
+    }
+}
+
 private val base = Typography()
-private val AppTypography = base.copy(
+private val typography = base.copy(
     displayMedium = base.displayMedium.copy(fontWeight = FontWeight.Bold),
-    headlineLarge = base.headlineLarge.copy(fontFamily = Serif, fontWeight = FontWeight.Bold),
-    headlineMedium = base.headlineMedium.copy(fontFamily = Serif, fontWeight = FontWeight.Bold),
-    headlineSmall = base.headlineSmall.copy(fontFamily = Serif, fontWeight = FontWeight.Bold),
+    headlineLarge = base.headlineLarge.copy(fontWeight = FontWeight.Bold),
+    headlineMedium = base.headlineMedium.copy(fontWeight = FontWeight.Bold),
+    headlineSmall = base.headlineSmall.copy(fontWeight = FontWeight.Bold),
     titleLarge = base.titleLarge.copy(fontWeight = FontWeight.SemiBold),
 )
 
-private val AppShapes = Shapes(
-    small = RoundedCornerShape(12.dp), medium = RoundedCornerShape(20.dp), large = RoundedCornerShape(24.dp),
-)
-
 @Composable
-fun BlockerTheme(content: @Composable () -> Unit) {
-    MaterialTheme(
-        colorScheme = if (isSystemInDarkTheme()) Dark else Light,
-        typography = AppTypography,
-        shapes = AppShapes,
-    ) { Surface(color = MaterialTheme.colorScheme.background, content = content) }
+fun BlockerTheme(theme: AppTheme = AppTheme.ORANGE, mode: AppearanceMode = AppearanceMode.SYSTEM, content: @Composable () -> Unit) {
+    val dark = when (mode) { AppearanceMode.SYSTEM -> isSystemInDarkTheme(); AppearanceMode.LIGHT -> false; AppearanceMode.DARK -> true }
+    val look = look(theme, dark)
+    val r = CardRadius
+    CompositionLocalProvider(LocalLook provides look) {
+        MaterialTheme(
+            colorScheme = look.scheme,
+            typography = typography,
+            shapes = Shapes(small = RoundedCornerShape(r / 2), medium = RoundedCornerShape(r * 5 / 6), large = RoundedCornerShape(r)),
+        ) {
+            Surface(color = look.scheme.background, content = content)
+        }
+    }
 }
 
-/** Soft pink-to-peach wash used by the hero card. */
-@Composable
-fun heroBrush(): Brush = if (isSystemInDarkTheme())
-    Brush.linearGradient(listOf(Color(0xFF3A2440), Color(0xFF3D2E2A)))
-else Brush.linearGradient(listOf(Color(0xFFFBD3EC), Color(0xFFFCE7E4), Color(0xFFFDE3C8)))
+private val CardRadius = 24.dp
 
-/** White rounded card with no elevation, as in the reference design. */
+/** The bright rim that makes glass read as glass. */
 @Composable
-fun WhiteCard(modifier: Modifier = Modifier, content: @Composable () -> Unit) = Surface(
-    modifier.fillMaxWidth(), shape = RoundedCornerShape(24.dp), color = MaterialTheme.colorScheme.surfaceContainer, content = content,
+fun glassBorder(): BorderStroke = BorderStroke(
+    1.dp, Brush.verticalGradient(
+        if (LocalLook.current.dark) listOf(Color.White.copy(alpha = 0.22f), Color.White.copy(alpha = 0.05f))
+        else listOf(Color.White.copy(alpha = 0.95f), Color.White.copy(alpha = 0.35f)),
+    ),
 )
 
-/** Black pill call-to-action. */
+/** Fill for the hero cards: the same frost as other cards. */
+@Composable
+fun heroBrush(): Brush = SolidColor(frost())
+
+/** Frosted card with a light rim and no elevation. */
+@Composable
+fun WhiteCard(modifier: Modifier = Modifier, content: @Composable () -> Unit) = Surface(
+    modifier.fillMaxWidth(), shape = RoundedCornerShape(CardRadius), color = frost(), border = glassBorder(), content = content,
+)
+
+/** See-through card fill for the frosted look. */
+@Composable
+private fun frost() = if (LocalLook.current.dark) Color.White.copy(alpha = 0.07f) else Color.White.copy(alpha = 0.6f)
+
+/** Pill call-to-action in the theme's primary colour. */
 @Composable
 fun PillButton(text: String, modifier: Modifier = Modifier, enabled: Boolean = true, trailing: String? = null, onClick: () -> Unit) = Button(
     onClick = onClick, enabled = enabled, modifier = modifier,
@@ -139,13 +195,12 @@ fun Pill(text: String, color: Color, modifier: Modifier = Modifier) = Text(
     color = color, style = MaterialTheme.typography.labelMedium, fontWeight = FontWeight.SemiBold,
 )
 
-private val ProgressGradient = listOf(Color(0xFF9B7BFF), Color(0xFFE77FC6), Color(0xFFF7A77C))
-
-/** Ring with a soft gradient sweep and rounded ends; animates on change. */
+/** Ring in the solid accent colour with rounded ends; animates on change. */
 @Composable
-fun GradientRing(fraction: Float, size: Dp, stroke: Dp, modifier: Modifier = Modifier, content: @Composable () -> Unit = {}) {
+fun ProgressRing(fraction: Float, size: Dp, stroke: Dp, modifier: Modifier = Modifier, content: @Composable () -> Unit = {}) {
     val f by animateFloatAsState(fraction.coerceIn(0f, 1f), tween(900, easing = FastOutSlowInEasing), label = "ring")
     val track = MaterialTheme.colorScheme.onSurface.copy(alpha = 0.08f)
+    val accent = LocalLook.current.accent
     Box(modifier.size(size), contentAlignment = Alignment.Center) {
         Canvas(Modifier.fillMaxSize()) {
             val w = stroke.toPx()
@@ -153,22 +208,22 @@ fun GradientRing(fraction: Float, size: Dp, stroke: Dp, modifier: Modifier = Mod
             val topLeft = Offset(w / 2, w / 2)
             drawArc(track, 0f, 360f, false, topLeft, arc, style = Stroke(w))
             if (f > 0f) rotate(-90f) {
-                drawArc(Brush.sweepGradient(ProgressGradient + ProgressGradient.first()), 0f, 360f * f, false, topLeft, arc,
-                    style = Stroke(w, cap = StrokeCap.Round))
+                drawArc(accent, 0f, 360f * f, false, topLeft, arc, style = Stroke(w, cap = StrokeCap.Round))
             }
         }
         content()
     }
 }
 
-/** Thick rounded bar with gradient fill; turns [alert] colour once the limit is reached. */
+/** Thick rounded bar in the accent colour; turns [alert] colour once the limit is reached. */
 @Composable
 fun SmoothBar(fraction: Float, modifier: Modifier = Modifier, alert: Color? = null, height: Dp = 8.dp) {
     val f by animateFloatAsState(fraction.coerceIn(0f, 1f), tween(700, easing = FastOutSlowInEasing), label = "bar")
+    val accent = LocalLook.current.accent
     Box(modifier.fillMaxWidth().height(height).clip(RoundedCornerShape(50)).background(MaterialTheme.colorScheme.onSurface.copy(alpha = 0.07f))) {
         if (f > 0f) Box(
             Modifier.fillMaxHeight().fillMaxWidth(f.coerceAtLeast(0.04f)).clip(RoundedCornerShape(50))
-                .background(if (alert != null) SolidColor(alert) else Brush.horizontalGradient(ProgressGradient)),
+                .background(alert ?: accent),
         )
     }
 }

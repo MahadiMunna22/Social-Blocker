@@ -9,6 +9,7 @@ import ch.puc.blocker.data.seedIfEmpty
 import ch.puc.blocker.domain.RuleConfig
 import ch.puc.blocker.data.GlobalSettings
 import ch.puc.blocker.receiver.Alarms
+import ch.puc.blocker.receiver.Protection
 import ch.puc.blocker.service.BlockerService
 import ch.puc.blocker.service.TaskNotifications
 import kotlinx.coroutines.CoroutineScope
@@ -36,6 +37,7 @@ class BlockerApp : Application() {
         getSystemService(NotificationManager::class.java)
             .createNotificationChannels(BlockerService.channels() + TaskNotifications.channel())
         Alarms.scheduleMidnight(this)
+        Protection.apply(this)
     }
 }
 
@@ -55,4 +57,6 @@ fun ruleConfig(app: TrackedApp, s: GlobalSettings) = RuleConfig(
     cooldownMs = app.cooldownMin * 60_000L,
     dailyCapMs = app.dailyCapMin * 60_000L,
     graceMs = s.sessionGraceSec * 1_000L,
+    banned = app.banned,
+    opensPerDay = app.opensPerDay,
 )

@@ -3,7 +3,10 @@ package ch.puc.blocker.receiver
 import android.annotation.SuppressLint
 import android.app.AlarmManager
 import android.app.PendingIntent
+import android.app.admin.DeviceAdminReceiver
+import android.app.admin.DevicePolicyManager
 import android.content.BroadcastReceiver
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import ch.puc.blocker.BlockerApp
@@ -46,5 +49,33 @@ class BootReceiver : BroadcastReceiver() {
             BlockerService.start(context)
             Alarms.scheduleMidnight(context)
         }
+    }
+}
+
+/** Becomes device owner via `adb shell dpm set-device-owner ch.puc.blocker/.receiver.AdminReceiver`. */
+class AdminReceiver : DeviceAdminReceiver()
+
+/**
+ * Tamper protection. As device owner, the app can't be force-stopped, have its data cleared or be
+ * uninstalled. Android offers this to no other kind of app.
+ */
+object Protection {
+    private fun dpm(ctx: Context) = ctx.getSystemService(DevicePolicyManager::class.java)
+    private fun admin(ctx: Context) = ComponentName(ctx, AdminReceiver::class.java)
+
+    fun active(ctx: Context) = dpm(ctx).isDeviceOwnerApp(ctx.packageName)
+
+    fun apply(ctx: Context) {
+        if (!active(ctx)) return
+        dpm(ctx).setUserControlDisabledPackages(admin(ctx), listOf(ctx.packageName))
+        dpm(ctx).setUninstallBlocked(admin(ctx), ctx.packageName, true)
+    }
+
+    /** The only way out short of a factory reset, so the UI gates it behind the unlock. */
+    fun remove(ctx: Context) {
+        if (!active(ctx)) return
+        dpm(ctx).setUserControlDisabledPackages(admin(ctx), emptyList())
+        dpm(ctx).setUninstallBlocked(admin(ctx), ctx.packageName, false)
+        dpm(ctx).clearDeviceOwnerApp(ctx.packageName)
     }
 }

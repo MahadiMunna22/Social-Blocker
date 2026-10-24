@@ -14,6 +14,10 @@ data class TrackedApp(
     val dailyCapMin: Int = 60,
     /** Off = keep the app in the list but don't limit it. */
     @ColumnInfo(defaultValue = "1") val enabled: Boolean = true,
+    /** On the "can't install" list: always blocked, and asked to be uninstalled if it gets installed. */
+    @ColumnInfo(defaultValue = "0") val banned: Boolean = false,
+    /** Sessions allowed per day; 0 = no limit. */
+    @ColumnInfo(defaultValue = "0") val opensPerDay: Int = 0,
 )
 
 /** Single-row global settings (id is always 0). */
@@ -25,6 +29,20 @@ data class GlobalSettings(
     /** The lockout starts at the first unlock after this hour, so late-night use doesn't trigger it. */
     @ColumnInfo(defaultValue = "6") val morningStartHour: Int = 6,
     val sessionGraceSec: Int = 90,
+    /** Adult content filter (local DNS VPN, see WebFilterService). */
+    @ColumnInfo(defaultValue = "0") val webFilter: Boolean = false,
+    /** A short breathing pause before each new session of a tracked app. */
+    @ColumnInfo(defaultValue = "1") val pauseBeforeOpen: Boolean = true,
+    /** Back out of YouTube Shorts and Instagram Reels (needs the tamper guard's accessibility service). */
+    @ColumnInfo(defaultValue = "0") val blockShortForm: Boolean = false,
+    /** Quote set for the block and pause screens: a Quotes.Source ordinal (0 popular, 1 Quran, 2 Bible). */
+    @ColumnInfo(defaultValue = "0") val quoteSource: Int = 0,
+    /** Ticked quote sets as Quotes.Source bits; 0 = not set yet, use [quoteSource] (older single choice). */
+    @ColumnInfo(defaultValue = "0") val quoteMask: Int = 0,
+    /** ui.AppTheme ordinal. */
+    @ColumnInfo(defaultValue = "0") val theme: Int = 0,
+    /** ui.AppearanceMode ordinal: system, light or dark. */
+    @ColumnInfo(defaultValue = "0") val appearance: Int = 0,
     val challengeType: ChallengeType = ChallengeType.VOCAB,
     val mathDifficulty: Int = 2,
 )
@@ -40,6 +58,7 @@ data class DailyUsage(
     val sessionMs: Long = 0,
     val lastSeenMs: Long = 0,
     val cooldownUntilMs: Long = 0,
+    @ColumnInfo(defaultValue = "0") val opens: Int = 0,
 )
 
 /** First unlock of the day, used for the morning lockout. */
@@ -99,6 +118,8 @@ data class TaskItem(
     val estimateMin: Int,
     val createdMs: Long,
     val doneMs: Long = 0,        // 0 = not done
+    /** Finishing it adds a fresh copy due one week later (see completeTask). */
+    @ColumnInfo(defaultValue = "0") val repeatWeekly: Boolean = false,
 )
 
 /** A redeemed reward: [packageName] is free of all limits until [untilMs]. */

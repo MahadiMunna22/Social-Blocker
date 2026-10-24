@@ -1,5 +1,15 @@
 package ch.puc.blocker.domain
 
+/** Repeating tasks. */
+object Recurrence {
+    /** Next due day of a weekly task: a week after [dueEpochDay], skipping weeks already past [today]. */
+    fun nextWeekly(dueEpochDay: Long, today: Long): Long {
+        var d = dueEpochDay + 7
+        while (d < today) d += 7
+        return d
+    }
+}
+
 /** Pure reward math: finished task estimates buy short app unlocks. */
 object TaskRewards {
     const val COST_MIN = 120              // 2 hours of finished tasks…

@@ -6,6 +6,7 @@ import android.app.AppOpsManager
 import android.content.ActivityNotFoundException
 import android.content.Context
 import android.content.Intent
+import android.app.PendingIntent
 import android.content.pm.PackageManager
 import android.os.Bundle
 import android.os.PowerManager
@@ -24,13 +25,44 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.platform.LocalContext
 import androidx.core.net.toUri
 import androidx.lifecycle.compose.LifecycleResumeEffect
+import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import ch.puc.blocker.service.BlockerService
 
 class MainActivity : ComponentActivity() {
+    companion object {
+        private const val EXTRA_SCREEN = "screen"
+        const val SCREEN_TODAY = "TODAY"
+        const val SCREEN_TASKS = "TASKS"
+        const val SCREEN_UNLOCK = "UNLOCK"
+
+        /** Tap target for a notification: opens the app on [screen] (a tab name or [SCREEN_UNLOCK]), or as it was if null. */
+        fun open(ctx: Context, requestCode: Int, screen: String? = null): PendingIntent = PendingIntent.getActivity(
+            ctx, requestCode,
+            Intent(ctx, MainActivity::class.java).putExtra(EXTRA_SCREEN, screen)
+                .addFlags(Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP), // reuse the open screen
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+    }
+
     private val vm: SettingsViewModel by viewModels()
+
+    private fun route(intent: Intent?) {
+        when (val screen = intent?.getStringExtra(EXTRA_SCREEN)) {
+            null -> {}
+            SCREEN_UNLOCK -> vm.openUnlockWhenReady()
+            else -> vm.requestedTab = screen
+        }
+        intent?.removeExtra(EXTRA_SCREEN) // don't route again on rotation
+    }
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        route(intent)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        if (savedInstanceState == null) route(intent)
         enableEdgeToEdge()
         setContent {
             val ctx = LocalContext.current
@@ -41,7 +73,11 @@ class MainActivity : ComponentActivity() {
             val ready = permTick >= 0 && Perms.requiredGranted(ctx)
             val setup = if (showSetup == -1) !ready else showSetup == 1
 
-            BlockerTheme {
+            val s by vm.settings.collectAsStateWithLifecycle()
+            BlockerTheme(
+                theme = AppTheme.entries.getOrElse(s?.theme ?: 0) { AppTheme.ORANGE },
+                mode = AppearanceMode.entries.getOrElse(s?.appearance ?: 0) { AppearanceMode.SYSTEM },
+            ) {
                 AnimatedContent(targetState = when {
                     vm.unlockStep != null -> 0
                     setup -> 1

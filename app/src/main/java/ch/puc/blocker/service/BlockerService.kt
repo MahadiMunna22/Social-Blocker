@@ -19,6 +19,7 @@ import android.os.Build
 import android.os.PowerManager
 import android.util.Log
 import androidx.core.app.ServiceCompat
+import androidx.core.net.toUri
 import androidx.lifecycle.LifecycleService
 import androidx.lifecycle.lifecycleScope
 import ch.puc.blocker.BlockerApp
@@ -33,15 +34,19 @@ import ch.puc.blocker.domain.Decision
 import ch.puc.blocker.domain.FgEvent
 import ch.puc.blocker.domain.Remaining
 import ch.puc.blocker.domain.RuleEngine
+import ch.puc.blocker.domain.Quotes
 import ch.puc.blocker.domain.StatusText
 import ch.puc.blocker.domain.UsageAggregator
 import ch.puc.blocker.domain.UsageState
 import ch.puc.blocker.overlay.BlockOverlay
+import ch.puc.blocker.overlay.PauseOverlay
 import ch.puc.blocker.overlay.TimerOverlay
 import ch.puc.blocker.overlay.goHome
 import ch.puc.blocker.ruleConfig
 import ch.puc.blocker.ui.MainActivity
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.collectLatest
@@ -63,6 +68,7 @@ class BlockerService : LifecycleService() {
         const val ACTION_REFRESH_NOTIFICATION = "ch.puc.blocker.REFRESH_NOTIFICATION"
         private const val CHANNEL = "blocker"
         private const val CHANNEL_UNLOCK = "unlock"
+        private const val CHANNEL_BANNED = "banned"
         private const val ID_STATUS = 1
         private const val ID_UNLOCK = 2
         private const val TAG = "BlockerService"
@@ -72,14 +78,20 @@ class BlockerService : LifecycleService() {
         private const val ENFORCE_RETRY_MS = 3_000L
         /** A normal app switch pauses then stops within a moment; paused this long without a stop means PiP. */
         private const val PIP_SETTLE_MS = 1_500L
+        /** How late a usage event may show up after its timestamp; that window is replayed every tick. */
+        private const val EVENT_SETTLE_MS = 10_000L
 
         /** True while the service is alive; shown in the UI as a health indicator. */
         @Volatile var running = false
             private set
 
+        /** Nudged by the accessibility service on every window change, so a switch is handled at once, not next second. */
+        val wake = Channel<Unit>(Channel.CONFLATED)
+
         fun channels() = listOf(
             NotificationChannel(CHANNEL, "Blocker", NotificationManager.IMPORTANCE_LOW),
             NotificationChannel(CHANNEL_UNLOCK, "Unlock ready", NotificationManager.IMPORTANCE_DEFAULT),
+            NotificationChannel(CHANNEL_BANNED, "Blocked installs", NotificationManager.IMPORTANCE_HIGH),
         )
 
         fun start(context: Context, action: String? = null) {
@@ -96,6 +108,7 @@ class BlockerService : LifecycleService() {
     private val nm by lazy { getSystemService(NotificationManager::class.java) }
     private lateinit var overlay: BlockOverlay
     private lateinit var timer: TimerOverlay
+    private lateinit var pause: PauseOverlay
 
     // Kept fresh by Room flows, so edits apply without restarting.
     @Volatile private var apps: Map<String, TrackedApp> = emptyMap()
@@ -114,6 +127,14 @@ class BlockerService : LifecycleService() {
         }
     }
 
+    /** Android can't stop a Play Store install, so a banned app that lands gets an uninstall prompt right away. */
+    private val installReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val pkg = intent.data?.schemeSpecificPart ?: return
+            apps[pkg]?.takeIf { it.banned }?.let(::askUninstall)
+        }
+    }
+
     private var loop: Job? = null
     private var day = ""
     private var reloadDay = false
@@ -122,15 +143,19 @@ class BlockerService : LifecycleService() {
     /** Packages whose [usage] changed since the last write to Room. */
     private val dirty = mutableSetOf<String>()
     private var lastFlush = 0L
+    /** Package of the most recently resumed activity that is still resumed. */
     private var fgPackage: String? = null
-    /** Package → when it paused without stopping yet (still visible, e.g. picture-in-picture). */
-    private val pausedVisible = mutableMapOf<String, Long>()
-    private var lastEventQuery = 0L
+    /** "package/class" → when it paused without stopping yet (still visible, e.g. picture-in-picture). */
+    private var pausedVisible: Map<String, Long> = emptyMap()
+    /** Activity state as of [settledAt]. Events before it are assumed delivered; later ones are replayed each tick. */
+    private var settledAt = 0L
+    private var settledResumed: Map<String, Long> = emptyMap()
+    private var settledPaused: Map<String, Long> = emptyMap()
     private var lastTick = 0L
     private var lastSystemSync = 0L
 
-    /** Block card currently on screen (label to block); stays over the home screen until dismissed. */
-    private var shownBlock: Pair<String, Decision.Block>? = null
+    /** Block card currently on screen (app to block); stays over the home screen until dismissed. */
+    private var shownBlock: Pair<TrackedApp, Decision.Block>? = null
     private var enforcedPkg: String? = null
     private var enforcedAt = 0L
 
@@ -141,6 +166,11 @@ class BlockerService : LifecycleService() {
         super.onCreate()
         running = true
         overlay = BlockOverlay(this) { shownBlock = null }
+        pause = PauseOverlay(this, onOpen = { pkg ->
+            usage[pkg] = RuleEngine.open(usage[pkg] ?: UsageState(), System.currentTimeMillis())
+            dirty += pkg
+            lifecycleScope.launch { flush() } // an open must survive a restart
+        }, onClose = { runCatching { goHome() } })
         timer = TimerOverlay(this)
         startInForeground()
         interactive.value = getSystemService(PowerManager::class.java).isInteractive
@@ -148,8 +178,16 @@ class BlockerService : LifecycleService() {
             addAction(Intent.ACTION_SCREEN_ON)
             addAction(Intent.ACTION_SCREEN_OFF)
         }, RECEIVER_NOT_EXPORTED)
+        registerReceiver(installReceiver, IntentFilter(Intent.ACTION_PACKAGE_ADDED).apply { addDataScheme("package") }, RECEIVER_NOT_EXPORTED)
         lifecycleScope.launch { dao.observeApps().collect { list -> apps = list.filter { it.enabled }.associateBy { it.packageName }; lastSystemSync = 0 } }
-        lifecycleScope.launch { dao.observeSettings().collect { settings = it } }
+        lifecycleScope.launch {
+            dao.observeSettings().collect {
+                settings = it
+                GuardService.blockShortForm = it?.blockShortForm == true
+                Quotes.sources(it?.quoteMask ?: 0, it?.quoteSource ?: 0).let { q -> overlay.quoteSources = q; pause.quoteSources = q }
+                WebFilterService.sync(this@BlockerService, it?.webFilter == true)
+            }
+        }
         lifecycleScope.launch {
             dao.observeTasks().collect { list -> openTasks = list.filter { it.doneMs == 0L } }
         }
@@ -180,7 +218,7 @@ class BlockerService : LifecycleService() {
             while (isActive) {
                 if (!interactive.value) sleepUntilScreenOn()
                 runCatching { tick() }.onFailure { Log.e(TAG, "tick failed", it) }
-                delay(1_000)
+                withTimeoutOrNull(1_000) { wake.receive(); delay(150) } // give the usage log a moment to catch up
             }
         }
         return START_STICKY
@@ -189,6 +227,7 @@ class BlockerService : LifecycleService() {
     override fun onDestroy() {
         running = false
         runCatching { unregisterReceiver(screenReceiver) }
+        runCatching { unregisterReceiver(installReceiver) }
         hideAll()
         // lifecycleScope is cancelled from here on, so hand the last write to the app scope.
         val pending = takeDirty()
@@ -203,6 +242,9 @@ class BlockerService : LifecycleService() {
         interactive.first { it }
         lastTick = 0 // no time passes in a tracked app while the screen is off
         lastSystemSync = 0 // catch up on anything used while we slept
+        // Screen-off pauses every activity, so start clean: this drops any app whose process died without a pause event.
+        settledResumed = emptyMap(); settledPaused = emptyMap(); settledAt = System.currentTimeMillis() - 2_000
+        WebFilterService.sync(this, settings?.webFilter == true) // Private DNS may have changed meanwhile
     }
 
     private suspend fun tick() {
@@ -229,9 +271,9 @@ class BlockerService : LifecycleService() {
         val s = settings ?: return
         updateFirstUnlock(today, now, s)
         val app = fgPackage?.let { apps[it] }
-        val pip = pictureInPictureApp(now)?.takeIf { it != app }
+        val others = alsoVisibleApps(now)
         // Full-day scan only when it can matter: on (re)start, after screen-on and while a tracked app is open.
-        if (lastSystemSync == 0L || ((app != null || pip != null) && now - lastSystemSync >= SYSTEM_SYNC_MS)) syncSystemUsage(now)
+        if (lastSystemSync == 0L || ((app != null || others.isNotEmpty()) && now - lastSystemSync >= SYSTEM_SYNC_MS)) syncSystemUsage(now)
 
         if (!s.blockingEnabled) {
             hideAll()
@@ -240,15 +282,15 @@ class BlockerService : LifecycleService() {
             return
         }
 
-        if (app == null && pip == null) timer.hide()
-        if (app == null && pip == null) enforcedPkg = null // reopening it right away gets closed again
-        // A picture-in-picture window is still in use: it counts, shows the timer and gets closed on timeout.
+        if (app == null && others.isEmpty()) { timer.hide(); enforcedPkg = null } // reopening it right away gets closed again
+        if (pause.shownFor != null && pause.shownFor != app?.packageName) pause.hide() // left before deciding
+        // A PiP window is still in use: it counts, shows the timer and gets closed on timeout.
         val fgLine = app?.let { apply(it, s, now, delta, pip = false, showTimer = true) }
-        val pipLine = pip?.let { apply(it, s, now, delta, pip = true, showTimer = app == null) }
-        val inUse = fgLine ?: pipLine
+        val otherLines = others.mapIndexed { i, a -> apply(a, s, now, delta, pip = true, showTimer = app == null && i == 0) }
+        val inUse = fgLine ?: otherLines.firstNotNullOfOrNull { it }
 
         // Keep the block card (now over the home screen) counting down until dismissed or expired.
-        shownBlock?.let { (label, block) -> if (now >= block.untilMs) { shownBlock = null; overlay.hide() } else overlay.show(label, block) }
+        shownBlock?.let { (app, block) -> if (now >= block.untilMs) { shownBlock = null; overlay.hide() } else overlay.show(app.label, block, app.packageName) }
         if (now - lastFlush >= FLUSH_MS) flush()
         status(null, now, s, inUse)
     }
@@ -269,6 +311,20 @@ class BlockerService : LifecycleService() {
         val cfg = ruleConfig(app, s)
         var state = usage[pkg] ?: UsageState()
         var decision = RuleEngine.evaluate(now, firstUnlock, Day.startOfTomorrowMs(), cfg, state)
+        if (decision == Decision.Allow && !pip && RuleEngine.isNewSession(state, now, cfg)) {
+            if (s.pauseBeforeOpen) {
+                // New session: a breath first. Nothing counts until Open, and its video is paused meanwhile.
+                if (showTimer) timer.hide()
+                shownBlock = null
+                overlay.hide()
+                if (pause.shownFor != pkg) stopPlayback()
+                pause.show(pkg, app.label, if (cfg.opensPerDay > 0) cfg.opensPerDay - state.opens else null)
+                return "${app.label} · taking a breath"
+            }
+            state = RuleEngine.open(state, now)
+            usage[pkg] = state
+            dirty += pkg
+        }
         if (decision == Decision.Allow) {
             val next = RuleEngine.accrue(state, now, delta, cfg)
             usage[pkg] = next
@@ -294,8 +350,8 @@ class BlockerService : LifecycleService() {
      * A picture-in-picture window is first brought back to full screen, because going home doesn't close it.
      */
     private fun enforceBlock(app: TrackedApp, block: Decision.Block, now: Long, pip: Boolean) {
-        shownBlock = app.label to block
-        overlay.show(app.label, block)
+        shownBlock = app to block
+        overlay.show(app.label, block, app.packageName)
         if (app.packageName == enforcedPkg && now - enforcedAt < ENFORCE_RETRY_MS) return
         enforcedPkg = app.packageName
         enforcedAt = now
@@ -328,12 +384,13 @@ class BlockerService : LifecycleService() {
     private fun hideAll() {
         overlay.hide()
         timer.hide()
+        pause.hide()
     }
 
     private fun takeDirty(): List<DailyUsage> {
         if (day.isEmpty() || dirty.isEmpty()) return emptyList()
         val rows = dirty.mapNotNull { pkg ->
-            usage[pkg]?.let { DailyUsage(day, pkg, it.totalMs, it.sessionMs, it.lastSeenMs, it.cooldownUntilMs) }
+            usage[pkg]?.let { DailyUsage(day, pkg, it.totalMs, it.sessionMs, it.lastSeenMs, it.cooldownUntilMs, it.opens) }
         }
         dirty.clear()
         return rows
@@ -351,7 +408,7 @@ class BlockerService : LifecycleService() {
         lastSystemSync = 0
         usage.clear()
         dirty.clear()
-        dao.usage(today).forEach { usage[it.packageName] = UsageState(it.totalMs, it.sessionMs, it.lastSeenMs, it.cooldownUntilMs) }
+        dao.usage(today).forEach { usage[it.packageName] = UsageState(it.totalMs, it.sessionMs, it.lastSeenMs, it.cooldownUntilMs, it.opens) }
         firstUnlock = dao.dayState(today)?.firstUnlockMs
     }
 
@@ -406,32 +463,52 @@ class BlockerService : LifecycleService() {
     }
 
     /**
-     * The tracked app showing a picture-in-picture window, if any. PiP activities are paused but not stopped,
-     * so a pause with no stop after [PIP_SETTLE_MS] means the app is still on screen.
-     * (An app half-covered by another app's dialog looks the same, and counts as in use too.)
+     * Tracked apps on screen besides [fgPackage]: paused but not stopped for [PIP_SETTLE_MS]
+     * (picture-in-picture, or half-covered by a dialog). An app still resumed under the launcher
+     * (half swipe to Recents) doesn't count: it's not being used, and it's back as [fgPackage] on release.
      */
-    private fun pictureInPictureApp(now: Long): TrackedApp? = pausedVisible.entries
-        .firstOrNull { (pkg, pausedAt) -> pkg != fgPackage && now - pausedAt >= PIP_SETTLE_MS && pkg in apps }
-        ?.let { apps[it.key] }
+    private fun alsoVisibleApps(now: Long): List<TrackedApp> =
+        pausedVisible.filterValues { now - it >= PIP_SETTLE_MS }.keys.map { it.substringBefore('/') }
+            .distinct().filter { it != fgPackage }.mapNotNull { apps[it] }
 
-    /** Incrementally replays usage events to track the resumed activity's package and paused-but-visible ones. */
+    /**
+     * Replays usage events to track every resumed activity and the paused-but-visible ones.
+     * Android can log an event a moment after its timestamp, so querying only "since last tick" can
+     * miss an app opening for good (timer gone, nothing counted). Instead, the last [EVENT_SETTLE_MS]
+     * are replayed every tick from a settled snapshot, so late events still land in order.
+     */
     private fun updateForeground(now: Long) {
-        val from = if (lastEventQuery == 0L) now - 60 * 60_000 else lastEventQuery
-        val events = usm.queryEvents(from, now)
-        lastEventQuery = now
+        if (settledAt == 0L) settledAt = now - 60 * 60_000
+        val settleBefore = (now - EVENT_SETTLE_MS).coerceAtLeast(settledAt)
+        val res = settledResumed.toMutableMap()
+        val paused = settledPaused.toMutableMap()
+        var snapped = false
+        fun snap() { settledResumed = res.toMap(); settledPaused = paused.toMap(); snapped = true }
+        val events = usm.queryEvents(settledAt, now)
         val e = UsageEvents.Event()
-        while (events.getNextEvent(e)) when (e.eventType) {
-            UsageEvents.Event.ACTIVITY_RESUMED -> { fgPackage = e.packageName; pausedVisible.remove(e.packageName) }
-            UsageEvents.Event.ACTIVITY_PAUSED -> { if (e.packageName == fgPackage) fgPackage = null; pausedVisible[e.packageName] = e.timeStamp }
-            UsageEvents.Event.ACTIVITY_STOPPED -> pausedVisible.remove(e.packageName)
+        while (events.getNextEvent(e)) {
+            if (!snapped && e.timeStamp >= settleBefore) snap()
+            val key = "${e.packageName}/${e.className}"
+            when (e.eventType) {
+                UsageEvents.Event.ACTIVITY_RESUMED -> { res[key] = e.timeStamp; paused.remove(key) }
+                UsageEvents.Event.ACTIVITY_PAUSED -> { res.remove(key); paused[key] = e.timeStamp }
+                UsageEvents.Event.ACTIVITY_STOPPED -> paused.remove(key)
+            }
         }
+        if (!snapped) snap()
+        settledAt = settleBefore
+        // Several can be resumed at once (a half swipe resumes the launcher over the app); the newest is in front,
+        // and the one underneath sends no new event when it's back, so the whole set is kept.
+        fgPackage = res.maxByOrNull { it.value }?.key?.substringBefore('/')
+        pausedVisible = paused
     }
 
     /** Apps blocked right now, soonest unblock first. Rewarded apps are free, so they're left out. */
     private fun blockedApps(now: Long, s: GlobalSettings): List<StatusText.Blocked> {
         val endOfDay = Day.startOfTomorrowMs()
         return apps.values.mapNotNull { app ->
-            if (now < (rewards[app.packageName] ?: 0)) return@mapNotNull null
+            // Banned apps are always blocked, usually not even installed: listing them would just be noise.
+            if (app.banned || now < (rewards[app.packageName] ?: 0)) return@mapNotNull null
             val d = RuleEngine.evaluate(now, firstUnlock, endOfDay, ruleConfig(app, s), usage[app.packageName] ?: UsageState())
             (d as? Decision.Block)?.let { StatusText.Blocked(app.label, it.reason, it.untilMs) }
         }.sortedBy { it.untilMs }
@@ -458,11 +535,13 @@ class BlockerService : LifecycleService() {
         val key = "$title\n$text\n${lines.joinToString("\n")}"
         if (key == lastStatus) return
         lastStatus = key
-        nm.notify(ID_STATUS, notification(title, text, lines))
+        // Nothing blocked or in use: the notification is about tasks, so it opens Tasks; otherwise Today.
+        val screen = if (override == null && inUse == null && blocked.isEmpty()) MainActivity.SCREEN_TASKS else MainActivity.SCREEN_TODAY
+        nm.notify(ID_STATUS, notification(title, text, lines, screen))
     }
 
-    private fun notification(title: String, text: String, lines: List<String> = emptyList()): Notification {
-        val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+    private fun notification(title: String, text: String, lines: List<String> = emptyList(), screen: String? = null): Notification {
+        val open = MainActivity.open(this, 0, screen)
         return Notification.Builder(this, CHANNEL)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(title)
@@ -476,8 +555,20 @@ class BlockerService : LifecycleService() {
             .also { lastNotification = it }
     }
 
+    private fun askUninstall(app: TrackedApp) {
+        val uninstall = PendingIntent.getActivity(this, app.packageName.hashCode(),
+            Intent(Intent.ACTION_DELETE, "package:${app.packageName}".toUri()), PendingIntent.FLAG_IMMUTABLE)
+        nm.notify(app.packageName.hashCode(), Notification.Builder(this, CHANNEL_BANNED)
+            .setSmallIcon(R.drawable.ic_notification)
+            .setContentTitle("${app.label} is on your can't-install list")
+            .setContentText("It stays blocked. Tap to uninstall it.")
+            .setContentIntent(uninstall)
+            .setAutoCancel(true)
+            .build())
+    }
+
     private fun notifyUnlockReady() {
-        val open = PendingIntent.getActivity(this, 1, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        val open = MainActivity.open(this, 1, MainActivity.SCREEN_UNLOCK)
         nm.notify(ID_UNLOCK, Notification.Builder(this, CHANNEL_UNLOCK)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle("Settings ready to unlock")

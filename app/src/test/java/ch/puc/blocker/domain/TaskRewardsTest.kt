@@ -28,3 +28,11 @@ class TaskRewardsTest {
         assertEquals(0, TaskRewards.balanceMin(60, 120))
     }
 }
+
+class RecurrenceTest {
+    @Test fun nextWeekIsSameWeekday_skippingPastWeeks() {
+        org.junit.Assert.assertEquals(17L, Recurrence.nextWeekly(dueEpochDay = 10, today = 9))   // on time
+        org.junit.Assert.assertEquals(24L, Recurrence.nextWeekly(dueEpochDay = 10, today = 20))  // two weeks late
+        org.junit.Assert.assertEquals(17L, Recurrence.nextWeekly(dueEpochDay = 10, today = 17))  // due today counts
+    }
+}

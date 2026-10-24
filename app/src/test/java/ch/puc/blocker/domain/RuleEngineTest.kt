@@ -21,6 +21,21 @@ class RuleEngineTest {
         assertEquals(Decision.Allow, RuleEngine.evaluate(100 * min, 0, eod, cfg, UsageState()))
     }
 
+    @Test fun outOfOpensBlocksOnlyANewSession() {
+        val c = cfg.copy(opensPerDay = 2)
+        val opened = RuleEngine.open(RuleEngine.open(UsageState(), 0), 100 * min) // second open at 100 min
+        assertEquals(2, opened.opens)
+        // Still inside the session (seen just now): allowed to finish.
+        assertEquals(Decision.Allow, RuleEngine.evaluate(100 * min + 1_000, null, eod, c, opened))
+        // Back after the grace period: a third session isn't allowed.
+        assertEquals(Decision.Block(Reason.OPENS, eod), RuleEngine.evaluate(110 * min, null, eod, c, opened))
+    }
+
+    @Test fun bannedIsAlwaysBlocked() {
+        val d = RuleEngine.evaluate(100 * min, null, eod, cfg.copy(banned = true), UsageState())
+        assertEquals(Reason.BANNED, (d as Decision.Block).reason)
+    }
+
     @Test fun morningLockout() {
         val d = RuleEngine.evaluate(10 * min, 0, eod, cfg, UsageState())
         assertEquals(Decision.Block(Reason.MORNING, 30 * min), d)

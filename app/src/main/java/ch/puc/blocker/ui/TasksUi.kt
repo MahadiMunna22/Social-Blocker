@@ -24,9 +24,17 @@ import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.material.icons.filled.Delete
+import androidx.compose.foundation.BorderStroke
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Button
+import androidx.compose.material3.FilledIconButton
+import androidx.compose.material.icons.filled.Add
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.material3.rememberDatePickerState
@@ -45,6 +53,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextDecoration
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import ch.puc.blocker.data.TaskItem
 import ch.puc.blocker.data.TrackedApp
@@ -82,15 +91,27 @@ internal fun TasksTab(vm: SettingsViewModel) {
     // Date-wise groups: overdue first, then each day in order.
     val groups = open.groupBy { if (it.dueEpochDay < today) "Overdue" else dayLabel(it.dueEpochDay, today) }
 
-    Screen("Tasks", "Finish tasks, earn app time") {
+    Screen {
+        item {
+            // Title with a round "+" instead of a full-width button.
+            Row(Modifier.padding(top = 4.dp), verticalAlignment = Alignment.CenterVertically) {
+                Column(Modifier.weight(1f)) {
+                    Text("Tasks", style = MaterialTheme.typography.headlineMedium)
+                    Text("Finish tasks, earn app time", color = MaterialTheme.colorScheme.onSurfaceVariant, style = MaterialTheme.typography.bodyMedium)
+                }
+                FilledIconButton(onClick = { adding = true }, Modifier.size(48.dp)) { Icon(Icons.Default.Add, "New task") }
+            }
+        }
         item { RewardCard(reward, now, rows.map { it.app }) { redeeming = true } }
-        item { PillButton("New task", Modifier.fillMaxWidth(), trailing = "+") { adding = true } }
         if (open.isEmpty()) item {
             Text("Nothing to do. Add assignments, homework or projects with a deadline.",
                 color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(8.dp))
         }
         groups.forEach { (label, list) ->
-            item { SectionTitle(if (label == "Overdue") "⚠ Overdue" else label) }
+            item {
+                Text(label.uppercase(), Modifier.padding(start = 16.dp, top = 4.dp), style = MaterialTheme.typography.labelMedium,
+                    color = if (label == "Overdue") Danger else MaterialTheme.colorScheme.onSurfaceVariant, letterSpacing = 0.8.sp)
+            }
             item { TaskList(list, today, onToggle = vm::toggleDone) { editing = it } }
         }
         if (done.isNotEmpty()) {
@@ -110,14 +131,19 @@ internal fun TasksTab(vm: SettingsViewModel) {
 private fun RewardCard(r: RewardState, now: Long, apps: List<TrackedApp>, onRedeem: () -> Unit) {
     val progress = (r.balanceMin % TaskRewards.COST_MIN) / TaskRewards.COST_MIN.toFloat()
     val ready = TaskRewards.canRedeem(r.balanceMin)
-    Box(Modifier.fillMaxWidth().background(heroBrush(), RoundedCornerShape(28.dp)).padding(24.dp)) {
-        Column {
-            Text("🎁 Reward progress", fontWeight = FontWeight.Medium)
+    WhiteCard {
+        Column(Modifier.padding(16.dp)) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                Text("🎁 Reward progress", Modifier.weight(1f), fontWeight = FontWeight.Medium)
+                // Small tonal chip, so the card doesn't carry a second big call-to-action.
+                if (ready) Text("Use ▸", Modifier.clip(RoundedCornerShape(50)).background(AccentSoft).clickable(onClick = onRedeem)
+                    .padding(horizontal = 14.dp, vertical = 6.dp), color = Accent, fontWeight = FontWeight.SemiBold)
+            }
             Text(
                 if (ready) "${r.balanceMin / TaskRewards.COST_MIN} unlock(s) ready" else "${hm(r.balanceMin.toLong())} of 2h",
-                style = MaterialTheme.typography.headlineMedium, modifier = Modifier.padding(vertical = 4.dp),
+                style = MaterialTheme.typography.headlineSmall, modifier = Modifier.padding(vertical = 4.dp),
             )
-            SmoothBar(if (ready) 1f else progress, height = 10.dp)
+            SmoothBar(if (ready) 1f else progress, height = 6.dp)
             Text(
                 "Every 2 hours of finished tasks unlocks one app for 10 minutes.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(top = 8.dp),
@@ -125,10 +151,6 @@ private fun RewardCard(r: RewardState, now: Long, apps: List<TrackedApp>, onRede
             r.active.forEach { (pkg, until) ->
                 val label = apps.find { it.packageName == pkg }?.label ?: pkg
                 Text("▶ $label unlocked · ${countdown(until - now)}", fontWeight = FontWeight.SemiBold, color = Accent, modifier = Modifier.padding(top = 6.dp))
-            }
-            if (ready) {
-                Spacer(Modifier.height(12.dp))
-                PillButton("Use a reward", trailing = "▶", onClick = onRedeem)
             }
         }
     }
@@ -138,7 +160,7 @@ private fun RewardCard(r: RewardState, now: Long, apps: List<TrackedApp>, onRede
 private fun TaskList(list: List<TaskItem>, today: Long, onToggle: (TaskItem) -> Unit, onOpen: (TaskItem) -> Unit) = WhiteCard {
     Column {
         list.forEachIndexed { i, t ->
-            if (i > 0) HorizontalDivider(Modifier.padding(horizontal = 16.dp), color = MaterialTheme.colorScheme.outlineVariant)
+            if (i > 0) HorizontalDivider(Modifier.padding(start = 50.dp), color = MaterialTheme.colorScheme.outlineVariant)
             TaskRow(t, today, onToggle, onOpen)
         }
     }
@@ -149,22 +171,23 @@ private fun TaskRow(t: TaskItem, today: Long, onToggle: (TaskItem) -> Unit, onOp
     val done = t.doneMs != 0L
     val cat = Category.of(t.category)
     val credited = TaskRewards.counts(TaskRewards.Task(t.estimateMin, t.createdMs, t.doneMs))
-    Row(Modifier.fillMaxWidth().clickable { onOpen(t) }.padding(16.dp), verticalAlignment = Alignment.CenterVertically) {
+    Row(Modifier.fillMaxWidth().clickable { onOpen(t) }.padding(horizontal = 14.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
         Box(
-            Modifier.size(28.dp).clip(CircleShape)
+            Modifier.size(22.dp).clip(CircleShape)
                 .background(if (done) Green else Color.Transparent)
                 .border(2.dp, if (done) Green else MaterialTheme.colorScheme.outline, CircleShape)
                 .clickable { onToggle(t) },
             contentAlignment = Alignment.Center,
-        ) { if (done) Icon(Icons.Default.Check, "Done", Modifier.size(16.dp), tint = Color.White) }
+        ) { if (done) Icon(Icons.Default.Check, "Done", Modifier.size(14.dp), tint = Color.White) }
         Column(Modifier.weight(1f).padding(start = 14.dp)) {
             Text(
-                t.title, fontWeight = FontWeight.SemiBold,
+                t.title, fontWeight = FontWeight.Medium, style = MaterialTheme.typography.bodyLarge, maxLines = 1, overflow = TextOverflow.Ellipsis,
                 textDecoration = if (done) TextDecoration.LineThrough else null,
                 color = if (done) MaterialTheme.colorScheme.onSurfaceVariant else MaterialTheme.colorScheme.onSurface,
             )
             val sub = buildString {
                 append("${cat.emoji} ${cat.label} · ⏱ ${hm(t.estimateMin.toLong())}")
+                if (t.repeatWeekly) append(" · 🔁 weekly")
                 if (done) append(if (credited) " · 🎁 counted" else " · not counted (finished too soon)")
                 else if (t.dueEpochDay < today) append(" · due ${dayLabel(t.dueEpochDay, today)}")
             }
@@ -183,6 +206,7 @@ private fun TaskSheet(existing: TaskItem?, onDismiss: () -> Unit, onSave: (TaskI
     var due by remember { mutableLongStateOf(existing?.dueEpochDay ?: today) }
     var estimate by remember { mutableIntStateOf(existing?.estimateMin ?: 60) }
     var picking by remember { mutableStateOf(false) }
+    var weekly by remember { mutableStateOf(existing?.repeatWeekly ?: false) }
 
     ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
         Column(Modifier.padding(horizontal = 24.dp).padding(bottom = 32.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -210,20 +234,40 @@ private fun TaskSheet(existing: TaskItem?, onDismiss: () -> Unit, onSave: (TaskI
             }
 
             Row(verticalAlignment = Alignment.CenterVertically) {
-                if (existing != null) TextButton(onClick = { onDelete(existing); onDismiss() }) { Text("Delete", color = Danger) }
-                Spacer(Modifier.weight(1f))
-                PillButton("Save", enabled = title.isNotBlank()) {
-                    onSave(
-                        existing?.copy(title = title.trim(), category = category.name, dueEpochDay = due, estimateMin = estimate)
-                            ?: TaskItem(title = title.trim(), category = category.name, dueEpochDay = due, estimateMin = estimate, createdMs = System.currentTimeMillis()),
-                    )
-                    onDismiss()
+                Column(Modifier.weight(1f)) {
+                    Text("Repeat every week", fontWeight = FontWeight.SemiBold)
+                    Text("When you finish it, it comes back due next ${LocalDate.ofEpochDay(due).dayOfWeek.getDisplayName(java.time.format.TextStyle.FULL, java.util.Locale.getDefault())}.",
+                        style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
+                Switch(weekly, { weekly = it })
             }
+
             if (existing == null) Text(
                 "Tip: add tasks before you start them. A task only counts toward rewards once it has been on your list for as long as its estimate.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant,
             )
+            // Full-width primary action; Delete sits beside it as a quiet outlined button when editing.
+            Row(Modifier.padding(top = 4.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                val shape = RoundedCornerShape(16.dp)
+                if (existing != null) OutlinedButton(
+                    onClick = { onDelete(existing); onDismiss() }, Modifier.height(52.dp), shape = shape,
+                    border = BorderStroke(1.dp, Danger.copy(alpha = 0.5f)),
+                ) { Icon(Icons.Default.Delete, null, Modifier.size(18.dp), tint = Danger); Text("  Delete", color = Danger) }
+                Button(
+                    onClick = {
+                        onSave(
+                            existing?.copy(title = title.trim(), category = category.name, dueEpochDay = due, estimateMin = estimate, repeatWeekly = weekly)
+                                ?: TaskItem(title = title.trim(), category = category.name, dueEpochDay = due, estimateMin = estimate,
+                                    createdMs = System.currentTimeMillis(), repeatWeekly = weekly),
+                        )
+                        onDismiss()
+                    },
+                    Modifier.weight(1f).height(52.dp), enabled = title.isNotBlank(), shape = shape,
+                ) {
+                    Icon(Icons.Default.Check, null, Modifier.size(20.dp))
+                    Text(if (existing == null) "  Add task" else "  Save changes", fontWeight = FontWeight.SemiBold)
+                }
+            }
         }
     }
 

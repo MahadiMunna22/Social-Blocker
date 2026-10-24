@@ -6,14 +6,18 @@ import android.content.Intent
 import android.graphics.Color
 import android.graphics.PixelFormat
 import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
 import android.graphics.drawable.GradientDrawable
 import android.provider.Settings
 import android.view.Gravity
+import android.view.View
+import androidx.core.net.toUri
 import android.view.WindowManager
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.TextView
 import ch.puc.blocker.domain.Decision
+import ch.puc.blocker.domain.Quotes
 import ch.puc.blocker.domain.Reason
 import java.text.DateFormat
 import java.util.Date
@@ -31,34 +35,38 @@ class BlockOverlay(private val context: Context, private val onDismiss: () -> Un
     private lateinit var title: TextView
     private lateinit var countdown: TextView
     private lateinit var detail: TextView
-    private lateinit var quote: TextView
+    private lateinit var quotes: QuoteCarousel
+    private lateinit var uninstall: Button
+    /** Package of the app on the card, for the Uninstall button. */
+    private var packageName: String? = null
 
-    private val quotes = listOf(
-        "Boredom is where good ideas start.",
-        "You decided this earlier. Trust that version of you.",
-        "Take three slow breaths before you pick up the phone again.",
-        "Go for a walk, drink some water or call a friend.",
-        "Lies das Buch, nicht den Feed.",
-    )
+    /** Set from the quote setting; 5 new quotes are picked each time the card appears. */
+    var quoteSources = setOf(Quotes.Source.POPULAR)
 
-    fun show(appLabel: String, block: Decision.Block) {
+    fun show(appLabel: String, block: Decision.Block, packageName: String? = null) {
         if (!Settings.canDrawOverlays(context)) return
         if (root == null) {
             root = create().also { wm.addView(it, params()) }
-            quote.text = quotes.random()
+            quotes.show(Quotes.pick(context, quoteSources))
         }
         val until = DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(block.untilMs))
         title.text = when (block.reason) {
             Reason.MORNING -> "Good morning ☀"
             Reason.COOLDOWN -> "Take a break"
             Reason.DAILY_CAP -> "That's enough for today"
+            Reason.BANNED -> "Not on this phone"
+            Reason.OPENS -> "No opens left today"
         }
         detail.text = when (block.reason) {
             Reason.MORNING -> "$appLabel is locked for the first part of your day, so it was closed.\nUnlocks at $until."
             Reason.COOLDOWN -> "You've hit your session limit for $appLabel, so it was closed.\nIt unlocks again at $until."
             Reason.DAILY_CAP -> "You've used your daily time for $appLabel, so it was closed.\nIt resets at midnight."
+            Reason.BANNED -> "$appLabel is on your can't-install list, so it was closed."
+            Reason.OPENS -> "You've opened $appLabel as often as you allowed today, so it was closed.\nIt resets at midnight."
         }
-        countdown.text = format(block.untilMs - System.currentTimeMillis())
+        countdown.text = if (block.reason == Reason.BANNED) "🚫" else format(block.untilMs - System.currentTimeMillis())
+        this.packageName = packageName
+        uninstall.visibility = if (block.reason == Reason.BANNED && packageName != null) View.VISIBLE else View.GONE
     }
 
     fun hide() {
@@ -82,22 +90,29 @@ class BlockOverlay(private val context: Context, private val onDismiss: () -> Un
     private fun create() = LinearLayout(context).apply {
         orientation = LinearLayout.VERTICAL
         gravity = Gravity.CENTER
-        background = GradientDrawable(GradientDrawable.Orientation.TOP_BOTTOM, intArrayOf(Color.rgb(28, 25, 58), Color.rgb(10, 10, 16)))
+        background = ColorDrawable(Color.rgb(20, 19, 34))
         setPadding(72, 72, 72, 72)
         val gap = { v: android.view.View, top: Int -> addView(v, LinearLayout.LayoutParams(-2, -2).apply { topMargin = top }) }
 
         title = text(28f, Color.WHITE, bold = true).also { gap(it, 0) }
         countdown = text(56f, Color.rgb(180, 170, 255), bold = true).also { gap(it, 32) }
         detail = text(16f, Color.rgb(210, 210, 225)).also { gap(it, 24) }
-        quote = text(14f, Color.rgb(150, 150, 170)).apply { setTypeface(typeface, Typeface.ITALIC) }.also { gap(it, 48) }
-        gap(Button(context).apply {
-            text = "OK"
-            isAllCaps = false
-            setTextColor(Color.WHITE)
-            background = GradientDrawable().apply { cornerRadius = 64f; setColor(Color.rgb(98, 84, 220)) }
-            setPadding(72, 32, 72, 32)
-            setOnClickListener { hide(); onDismiss() }
-        }, 56)
+        quotes = QuoteCarousel(context).also { addView(it, LinearLayout.LayoutParams(-1, -2).apply { topMargin = 40 }) }
+        // The card has to go so the system's uninstall dialog underneath can be tapped.
+        uninstall = button("Uninstall", Color.rgb(224, 69, 123)) {
+            packageName?.let { context.startActivity(Intent(Intent.ACTION_DELETE, "package:$it".toUri()).addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)) }
+            hide(); onDismiss()
+        }.also { gap(it, 56) }
+        gap(button("OK", Color.rgb(98, 84, 220)) { hide(); onDismiss() }, 24)
+    }
+
+    private fun button(label: String, color: Int, onClick: () -> Unit) = Button(context).apply {
+        text = label
+        isAllCaps = false
+        setTextColor(Color.WHITE)
+        background = GradientDrawable().apply { cornerRadius = 64f; setColor(color) }
+        setPadding(72, 32, 72, 32)
+        setOnClickListener { onClick() }
     }
 
     private fun params() = WindowManager.LayoutParams(

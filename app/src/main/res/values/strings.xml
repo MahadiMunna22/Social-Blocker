@@ -1,3 +1,4 @@
 <resources>
     <string name="app_name">Social Blocker</string>
+    <string name="guard_description">Stops Social Blocker from being force-stopped, uninstalled or switched off in Settings while its limits are locked.</string>
 </resources>

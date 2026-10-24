@@ -12,6 +12,7 @@ import android.graphics.drawable.Icon
 import ch.puc.blocker.BlockerApp
 import ch.puc.blocker.R
 import ch.puc.blocker.data.TaskItem
+import ch.puc.blocker.data.completeTask
 import ch.puc.blocker.domain.QuickTask
 import ch.puc.blocker.ui.MainActivity
 import kotlinx.coroutines.launch
@@ -79,7 +80,7 @@ object TaskNotifications {
         val next = next(open)
         val title = note ?: headline(open)
         val text = nextLine(open) ?: "Add something you need to get done."
-        val openApp = PendingIntent.getActivity(ctx, 2, Intent(ctx, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
+        val openApp = MainActivity.open(ctx, 2, MainActivity.SCREEN_TASKS)
         val n = Notification.Builder(ctx, CHANNEL)
             .setSmallIcon(R.drawable.ic_notification)
             .setContentTitle(title)
@@ -112,7 +113,7 @@ class TaskActionReceiver : BroadcastReceiver() {
                         }
                     }
                     TaskNotifications.ACTION_DONE -> dao.task(intent.getLongExtra(TaskNotifications.EXTRA_ID, -1))?.let { t ->
-                        dao.upsertTask(t.copy(doneMs = System.currentTimeMillis()))
+                        dao.completeTask(t, System.currentTimeMillis())
                         "Done: ${t.title} ✓"
                     }
                     else -> null

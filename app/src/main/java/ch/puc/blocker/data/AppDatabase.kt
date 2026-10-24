@@ -14,6 +14,8 @@ import androidx.room.Upsert
 import androidx.room.migration.AutoMigrationSpec
 import kotlinx.coroutines.flow.Flow
 import org.json.JSONArray
+import ch.puc.blocker.domain.Recurrence
+import java.time.LocalDate
 
 @Dao
 interface BlockerDao {
@@ -110,6 +112,9 @@ interface BlockerDao {
     suspend fun task(id: Long): TaskItem?
 
     @Upsert suspend fun upsertTask(t: TaskItem)
+
+    @Query("SELECT COUNT(*) FROM TaskItem WHERE title = :title AND dueEpochDay = :due AND doneMs = 0")
+    suspend fun openTaskCount(title: String, due: Long): Int
     @Delete suspend fun deleteTask(t: TaskItem)
 
     @Query("SELECT * FROM RewardUnlock")
@@ -125,12 +130,19 @@ class DropVocabTable : AutoMigrationSpec
 @Database(
     entities = [TrackedApp::class, GlobalSettings::class, DailyUsage::class, DayState::class,
         QuizItem::class, ChangeLog::class, ChallengeResult::class, UnlockWait::class, TaskItem::class, RewardUnlock::class],
-    version = 5,
+    version = 12,
     autoMigrations = [
         AutoMigration(from = 1, to = 2),
         AutoMigration(from = 2, to = 3, spec = DropVocabTable::class),
         AutoMigration(from = 3, to = 4),
         AutoMigration(from = 4, to = 5),
+        AutoMigration(from = 5, to = 6),
+        AutoMigration(from = 6, to = 7),
+        AutoMigration(from = 7, to = 8),
+        AutoMigration(from = 8, to = 9),
+        AutoMigration(from = 9, to = 10),
+        AutoMigration(from = 10, to = 11),
+        AutoMigration(from = 11, to = 12),
     ],
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -144,6 +156,17 @@ abstract class AppDatabase : RoomDatabase() {
                 .build().also { instance = it }
         }
     }
+}
+
+/**
+ * Marks [t] done. A weekly task also gets its next copy, due the same weekday after today;
+ * finishing twice (app and notification) doesn't add it twice.
+ */
+suspend fun BlockerDao.completeTask(t: TaskItem, now: Long) {
+    upsertTask(t.copy(doneMs = now))
+    if (!t.repeatWeekly) return
+    val next = Recurrence.nextWeekly(t.dueEpochDay, LocalDate.now().toEpochDay())
+    if (openTaskCount(t.title, next) == 0) upsertTask(t.copy(id = 0, dueEpochDay = next, createdMs = now, doneMs = 0))
 }
 
 /** Seeds defaults and the question bank from assets. New bank entries are merged in on app updates. */

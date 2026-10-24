@@ -2,6 +2,13 @@ package ch.puc.blocker.ui
 
 import android.app.Application
 import android.content.Intent
+import android.graphics.ImageDecoder
+import android.net.Uri
+import androidx.compose.ui.graphics.ImageBitmap
+import androidx.compose.ui.graphics.asImageBitmap
+import java.io.File
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
@@ -16,6 +23,7 @@ import ch.puc.blocker.data.GlobalSettings
 import ch.puc.blocker.data.QuizItem
 import ch.puc.blocker.data.RewardUnlock
 import ch.puc.blocker.data.TaskItem
+import ch.puc.blocker.data.completeTask
 import ch.puc.blocker.data.TrackedApp
 import ch.puc.blocker.data.UnlockWait
 import ch.puc.blocker.domain.BankItem
@@ -26,10 +34,14 @@ import ch.puc.blocker.domain.Decision
 import ch.puc.blocker.domain.Question
 import ch.puc.blocker.domain.Reason
 import ch.puc.blocker.domain.RuleEngine
+import ch.puc.blocker.domain.Quotes
+import ch.puc.blocker.domain.Streak
 import ch.puc.blocker.domain.TaskRewards
 import ch.puc.blocker.domain.UsageState
 import ch.puc.blocker.domain.WaitState
 import ch.puc.blocker.overlay.BlockOverlay
+import ch.puc.blocker.receiver.Protection
+import ch.puc.blocker.service.GuardService
 import ch.puc.blocker.ruleConfig
 import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.Job
@@ -65,7 +77,8 @@ data class QuizState(
 )
 
 /** Per-app timer values edited together in the UI. */
-data class Limits(val session: Int, val cooldown: Int, val cap: Int) {
+/** [opens] = sessions per day, 0 = no limit. */
+data class Limits(val session: Int, val cooldown: Int, val cap: Int, val opens: Int = 0) {
     companion object {
         val presets = listOf(
             "Light" to Limits(20, 15, 120),
@@ -75,7 +88,7 @@ data class Limits(val session: Int, val cooldown: Int, val cap: Int) {
     }
 }
 
-fun TrackedApp.limits() = Limits(sessionLimitMin, cooldownMin, dailyCapMin)
+fun TrackedApp.limits() = Limits(sessionLimitMin, cooldownMin, dailyCapMin, opensPerDay)
 
 private fun QuizItem.toBankItem() = BankItem(
     id, BankKind.valueOf(kind), level, prompt, answer,
@@ -92,13 +105,15 @@ data class RewardState(
 
 enum class UnlockStep { CHOOSE, QUIZ, WAIT }
 
-data class Candidate(val packageName: String, val label: String, val suggested: Boolean)
+/** [installed] = false: not on the phone, so adding it puts it on the "can't install" list. */
+data class Candidate(val packageName: String, val label: String, val suggested: Boolean, val installed: Boolean = true)
 
-/** Common social apps, surfaced first in the picker when installed. */
-private val SUGGESTED = setOf(
-    "com.instagram.android", "com.zhiliaoapp.musically", "com.ss.android.ugc.trill", "com.twitter.android",
-    "com.facebook.katana", "com.snapchat.android", "com.reddit.frontpage", "com.google.android.youtube",
-    "com.pinterest", "com.linkedin.android", "com.instagram.barcelona", "com.bereal.ft",
+/** Common social apps: surfaced first when installed, offered for the "can't install" list when not. */
+private val SUGGESTED = mapOf(
+    "com.instagram.android" to "Instagram", "com.zhiliaoapp.musically" to "TikTok", "com.ss.android.ugc.trill" to "TikTok (Asia)",
+    "com.twitter.android" to "X (Twitter)", "com.facebook.katana" to "Facebook", "com.snapchat.android" to "Snapchat",
+    "com.reddit.frontpage" to "Reddit", "com.google.android.youtube" to "YouTube", "com.pinterest" to "Pinterest",
+    "com.linkedin.android" to "LinkedIn", "com.instagram.barcelona" to "Threads", "com.bereal.ft" to "BeReal",
 )
 
 private const val TICK_MS = 1_000L
@@ -131,7 +146,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         val byPkg = usage.associateBy { it.packageName }
         apps.map { app ->
             val u = byPkg[app.packageName]
-            val state = UsageState(u?.totalMs ?: 0, u?.sessionMs ?: 0, u?.lastSeenMs ?: 0, u?.cooldownUntilMs ?: 0)
+            val state = UsageState(u?.totalMs ?: 0, u?.sessionMs ?: 0, u?.lastSeenMs ?: 0, u?.cooldownUntilMs ?: 0, u?.opens ?: 0)
             val cfg = ruleConfig(app, gs)
             // A session that has been idle longer than the grace period is effectively over.
             val session = if (t - state.lastSeenMs > cfg.graceMs) 0 else state.sessionMs
@@ -153,6 +168,13 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         }
     }.state(emptyList())
 
+    /** Days in a row under every daily cap, counted from the first day with data (30 days are kept). */
+    val streak: StateFlow<Int> = combine(today.flatMapLatest { dao.observeUsageSince(Day.daysAgo(29)) }, dao.observeApps()) { list, apps ->
+        val used = list.groupBy { LocalDate.parse(it.date) }.mapValues { (_, v) -> v.associate { it.packageName to it.totalMs } }
+        val caps = apps.filter { it.enabled && !it.banned }.associate { it.packageName to it.dailyCapMin * 60_000L }
+        Streak.days(used, caps, LocalDate.now(), since = used.keys.minOrNull() ?: LocalDate.now())
+    }.state(0)
+
     val changes: StateFlow<List<ChangeLog>> = dao.observeChanges().state(emptyList())
     val results: StateFlow<List<ChallengeResult>> = dao.observeResults().state(emptyList())
 
@@ -171,8 +193,9 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
 
     fun saveTask(task: TaskItem) = viewModelScope.launch { dao.upsertTask(task) }
     fun deleteTask(task: TaskItem) = viewModelScope.launch { dao.deleteTask(task) }
+    // ponytail: un-ticking a weekly task keeps the copy it already added; delete that copy by hand if needed.
     fun toggleDone(task: TaskItem) = viewModelScope.launch {
-        dao.upsertTask(task.copy(doneMs = if (task.doneMs == 0L) System.currentTimeMillis() else 0))
+        if (task.doneMs == 0L) dao.completeTask(task, System.currentTimeMillis()) else dao.upsertTask(task.copy(doneMs = 0))
     }
 
     /** Spends 2 h of finished tasks on a 10-minute unlock of one app. Earned, so no quiz needed. */
@@ -192,15 +215,19 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     var unlockStep by mutableStateOf<UnlockStep?>(null)
         private set
 
-    init {
-        viewModelScope.launch {
-            (application as BlockerApp).seeded.await()
-            engine = ChallengeEngine(
-                lastFailureMs = dao.lastFailureMs() ?: 0,
-                waitReadyAtMs = dao.unlockWait()?.readyAtMs ?: 0,
-            )
-        }
+    private val engineLoaded = viewModelScope.launch {
+        (application as BlockerApp).seeded.await()
+        engine = ChallengeEngine(
+            lastFailureMs = dao.lastFailureMs() ?: 0,
+            waitReadyAtMs = dao.unlockWait()?.readyAtMs ?: 0,
+        )
     }
+
+    /** Tab a notification asked for (a tab name); the scaffold switches to it and clears it. */
+    var requestedTab by mutableStateOf<String?>(null)
+
+    /** From the "ready to unlock" notification: the engine must be loaded to know a wait is ready to claim. */
+    fun openUnlockWhenReady() = viewModelScope.launch { engineLoaded.join(); openUnlock() }
 
     fun isUnlocked(t: Long) = t < unlockedUntilMs
     fun cooldownRemainingMs(): Long = engine?.cooldownRemainingMs() ?: 0
@@ -320,13 +347,14 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         log("${old.label}: session limit (min)", old.sessionLimitMin, new.sessionLimitMin)
         log("${old.label}: cooldown (min)", old.cooldownMin, new.cooldownMin)
         log("${old.label}: daily cap (min)", old.dailyCapMin, new.dailyCapMin)
+        log("${old.label}: opens per day", old.opensPerDay, new.opensPerDay)
     }
 
-    /** Adding apps only makes things stricter, so it never needs the unlock. */
+    /** Adding apps only makes things stricter, so it never needs the unlock. Removing them does ([removeApp]). */
     fun addApps(picked: List<Candidate>, limits: Limits) = viewModelScope.launch {
         picked.forEach {
-            dao.upsertApp(TrackedApp(it.packageName, it.label, limits.session, limits.cooldown, limits.cap))
-            log("Tracked apps", "-", "+ ${it.label}")
+            dao.upsertApp(TrackedApp(it.packageName, it.label, limits.session, limits.cooldown, limits.cap, banned = !it.installed, opensPerDay = limits.opens))
+            log(if (it.installed) "Tracked apps" else "Can't-install list", "-", "+ ${it.label}")
         }
     }
 
@@ -337,6 +365,95 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
             dao.upsertApp(app.copy(enabled = on))
             log("${app.label}: limits", if (app.enabled) "on" else "off", if (on) "on" else "off")
         }
+    }
+
+    /** Look of the app; never needs the unlock. */
+    /** Background photo behind the screens, or null. Kept as a copy, since the picker's access to the original is temporary. */
+    var background by mutableStateOf<ImageBitmap?>(null)
+        private set
+    private val backgroundFile get() = File(getApplication<Application>().filesDir, "background.jpg")
+
+    /** Copies the picked photo in, or removes it for null. */
+    fun setBackground(uri: Uri?) = viewModelScope.launch {
+        background = withContext(Dispatchers.IO) {
+            val f = backgroundFile
+            if (uri == null) f.delete()
+            else getApplication<Application>().contentResolver.openInputStream(uri)?.use { i -> f.outputStream().use { i.copyTo(it) } }
+            loadBackground()
+        }
+    }
+
+    /** Decoded at about screen size, so a 50 MP photo doesn't sit in memory at full size. */
+    private fun loadBackground(): ImageBitmap? = backgroundFile.takeIf { it.exists() }?.let { f ->
+        runCatching {
+            ImageDecoder.decodeBitmap(ImageDecoder.createSource(f)) { d, info, _ ->
+                val scale = (1440f / maxOf(info.size.width, info.size.height)).coerceAtMost(1f)
+                d.setTargetSize((info.size.width * scale).toInt(), (info.size.height * scale).toInt())
+            }.asImageBitmap()
+        }.getOrNull()
+    }
+
+    init { viewModelScope.launch { background = withContext(Dispatchers.IO) { loadBackground() } } }
+
+    fun setTheme(theme: AppTheme) = settings.value?.let { s -> viewModelScope.launch { dao.upsertSettings(s.copy(theme = theme.ordinal)) } }
+    fun setAppearance(mode: AppearanceMode) = settings.value?.let { s -> viewModelScope.launch { dao.upsertSettings(s.copy(appearance = mode.ordinal)) } }
+
+    /** Ticks or unticks a quote set; the last one can't be unticked. Not a loosening, so no unlock. */
+    fun toggleQuoteSource(source: Quotes.Source) {
+        val s = settings.value ?: return
+        val now = Quotes.sources(s.quoteMask, s.quoteSource)
+        val next = if (source in now) now - source else now + source
+        if (next.isEmpty()) return
+        viewModelScope.launch { dao.upsertSettings(s.copy(quoteMask = next.sumOf { it.bit })) }
+    }
+
+    /** Stricter (on) is instant; off needs the unlock. */
+    fun setPauseBeforeOpen(on: Boolean) = setStrictness(on, "Pause before opening") { it.copy(pauseBeforeOpen = on) }
+
+    /** Stricter (on) is instant; off needs the unlock. */
+    fun setBlockShortForm(on: Boolean) = setStrictness(on, "Block Shorts & Reels") { it.copy(blockShortForm = on) }
+
+    /** Switching quiz type or raising the math difficulty is instant; an easier math quiz needs the unlock. */
+    fun setQuiz(type: ChallengeType, difficulty: Int) {
+        val s = settings.value ?: return
+        val easier = type == ChallengeType.MATH && s.challengeType == ChallengeType.MATH && difficulty < s.mathDifficulty
+        if (easier && !requireUnlock()) return
+        viewModelScope.launch {
+            dao.upsertSettings(s.copy(challengeType = type, mathDifficulty = difficulty))
+            log("Challenge type", s.challengeType, type)
+            log("Math difficulty", s.mathDifficulty, difficulty)
+        }
+    }
+
+    private fun setStrictness(on: Boolean, what: String, change: (GlobalSettings) -> GlobalSettings) {
+        val s = settings.value ?: return
+        if (!on && !requireUnlock()) return
+        viewModelScope.launch {
+            dao.upsertSettings(change(s))
+            log(what, !on, on)
+        }
+    }
+
+    /** Switching the filter on is instant; off needs the unlock, like every other loosening. */
+    fun setWebFilter(on: Boolean) {
+        val s = settings.value ?: return
+        if (!on && !requireUnlock()) return
+        viewModelScope.launch {
+            dao.upsertSettings(s.copy(webFilter = on))
+            log("Adult content filter", s.webFilter, on)
+        }
+    }
+
+    /** Lets Settings show Social Blocker's stop/uninstall/disable screens for a few minutes. Needs the unlock. */
+    fun pauseGuard() = gated {
+        GuardService.pausedUntil = System.currentTimeMillis() + GuardService.PAUSE_MS
+        log("Tamper guard", "on", "paused 5 min")
+    }
+
+    /** Gives up device owner, so the app can be force-stopped and uninstalled again. Needs the unlock. */
+    fun removeProtection() = gated {
+        Protection.remove(getApplication())
+        log("Tamper protection", "on", "off")
     }
 
     fun toggleBlocking() {
@@ -368,6 +485,7 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
     fun previewOverlay() {
         var job: Job? = null
         val overlay = BlockOverlay(getApplication()) { job?.cancel() } // "OK" ends the preview early
+        overlay.quoteSources = settings.value.let { Quotes.sources(it?.quoteMask ?: 0, it?.quoteSource ?: 0) }
         job = viewModelScope.launch {
             try {
                 repeat(4) {
@@ -380,15 +498,19 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    /** Launchable apps not yet tracked, suggested social apps first. */
+    /** Launchable apps not yet tracked (suggested social apps first), then popular apps that aren't installed. */
     fun candidates(): List<Candidate> {
         val app = getApplication<Application>()
         val pm = app.packageManager
         val tracked = rows.value.map { it.app.packageName }.toSet()
-        return pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+        val installed = pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
             .map { Candidate(it.activityInfo.packageName, it.loadLabel(pm).toString(), it.activityInfo.packageName in SUGGESTED) }
             .filter { it.packageName !in tracked && it.packageName != app.packageName }
             .distinctBy { it.packageName }
             .sortedWith(compareByDescending<Candidate> { it.suggested }.thenBy { it.label.lowercase() })
+        val have = installed.map { it.packageName }.toSet()
+        val missing = SUGGESTED.filterKeys { it !in have && it !in tracked }
+            .map { (pkg, label) -> Candidate(pkg, label, suggested = false, installed = false) }
+        return installed + missing
     }
 }
