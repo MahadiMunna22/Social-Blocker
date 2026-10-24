@@ -1,60 +1,92 @@
 # Social Blocker
 
-Personal-use Android 13+ app that limits selected social apps. It runs a foreground service that polls `UsageStatsManager` about once a second while the screen is on (it sleeps while the screen is off). When an app is blocked, the service closes it and shows a block card over the home screen.
+An Android app that keeps social media in check. Set time limits per app, and when time is up the app is closed, not just covered.
 
-## Rules (strictest wins)
-1. **Morning lockout**: all tracked apps are blocked for N min (default 30) after the first unlock once morning starts (default 6:00, set in Settings). Unlocks during the night don't trigger it.
-2. **Session cooldown**: after N min (default 10) of use, with up to 90 s of backgrounding allowed, the app is blocked for M min (default 30).
-3. **Daily cap**: after N min (default 60) in a day, the app is blocked until midnight.
+<p align="center">
+  <img src="docs/screenshots/today.jpg" width="200" alt="Today">
+  <img src="docs/screenshots/tasks.jpg" width="200" alt="Tasks">
+  <img src="docs/screenshots/focus.jpg" width="200" alt="Focus">
+</p>
+<p align="center">
+  <img src="docs/screenshots/reports.jpg" width="200" alt="Reports">
+  <img src="docs/screenshots/settings.jpg" width="200" alt="Settings">
+  <img src="docs/screenshots/block-screen.jpg" width="200" alt="Block screen">
+</p>
 
-While a tracked app is open, a draggable timer at the top of the screen counts down to the next block. It turns amber with 1 minute left and red with 30 seconds left. At 0:00 the app is closed: you're sent to the home screen, its audio or video is paused, and a block card says why and for how long. Tap **OK** to dismiss it. Opening a blocked app again closes it again. Picture-in-picture counts as use too: the timer keeps running, and at 0:00 the PiP window is brought back to full screen and closed.
+## Features
 
-The ongoing notification names the app in use and its time left, or which apps are blocked and for how many minutes. Expand it to see every blocked app and all open tasks.
+**Limits**
+- **Session limit:** after N minutes of use, the app takes a break for M minutes.
+- **Daily limit:** after N minutes in a day, the app is blocked until midnight.
+- **Opens per day:** cap how often an app can be opened.
+- **Morning lockout:** no social apps for the first part of your morning (start hour is configurable).
+- **Can't-install list:** block apps you don't even have installed yet.
 
-The daily total is whichever is larger: the app's own count or Android's screen-time data for today (the same data Digital Wellbeing shows). So time used before installing the blocker still counts toward the daily limit.
+**When time runs out**
+- A floating timer counts down while you use a limited app, with a 10 s warning before it closes.
+- The app is closed (picture-in-picture included) and a block screen shows the time left and a rotating quote: Popular, Quran & Hadith, or Bible.
 
-## Structure
-| Path | Role |
-|---|---|
-| `domain/RuleEngine.kt` | Pure rule logic (`accrue`, `evaluate`), unit tested |
-| `domain/ChallengeEngine.kt` | Pure quiz logic (vocab/math, scoring, 60 s retry cooldown, 5 min unlock), unit tested |
-| `data/` | Room entities and a single DAO; vocab seeded from `assets/german_vocab.json` |
-| `service/BlockerService.kt` | `specialUse` foreground service with a 1 s polling loop |
-| `overlay/BlockOverlay.kt` | `TYPE_APPLICATION_OVERLAY` blocking window |
-| `receiver/Receivers.kt` | Exact midnight alarm and boot restart |
-| `ui/` | Compose settings screen and challenge gate (MVVM, no DI framework) |
+**Focus tools**
+- **Pause before opening:** a 5 s breather before each new session.
+- **Block Shorts & Reels:** backs out of YouTube Shorts and Instagram Reels; the rest of the app keeps working.
+- **Adult content filter:** a DNS filter (Cloudflare for Families) that runs on the phone.
+- **Tamper guard:** stops the app from being force-stopped or uninstalled from Settings.
 
-## Build & install
+**Staying honest**
+- Loosening any limit needs an **unlock quiz** (German vocabulary or math) or a 10-minute wait.
+- **Tasks with deadlines** (weekly repeats supported). Every 2 hours of finished tasks earns a 10-minute unlock.
+- **Reports:** a weekly chart (tap a day for per-app time), quiz results and a log of every rule change.
+
+**Looks**
+- Frosted-glass design with five accent colours, light and dark mode, and an optional background photo.
+
+## Install
+
+Requires Android 13 or newer.
+
 ```sh
 export JAVA_HOME="/Applications/Android Studio.app/Contents/jbr/Contents/Home"
-./gradlew :app:testDebugUnitTest :app:assembleDebug
-adb install app/build/outputs/apk/debug/app-debug.apk
+./gradlew :app:assembleDebug
+adb install -r app/build/outputs/apk/debug/app-debug.apk
 ```
-Open the app and grant everything in the **Setup required** card: usage access, draw over other apps, notifications and unrestricted battery. The service starts once usage access and overlay are granted.
 
-To test quickly, unlock editing, add an app and set its session limit to 1 min.
+Open the app and follow **Setup**. It asks for:
 
-### "Restricted setting" / toggle greyed out
-Android blocks usage access and overlay permissions for apps installed from an APK file.
-1. Try the toggle once so the "Restricted setting" dialog appears.
-2. Go to **App info → ⋮ → Allow restricted settings** and confirm with your PIN.
-3. Grant the permissions again.
+| Permission | Why |
+|---|---|
+| Usage access | See which app is open |
+| Display over other apps | Show the timer and block screen |
+| Notifications | Status and task reminders |
+| Unrestricted battery | Keep running in the background |
+| Accessibility (optional) | Tamper guard, Shorts & Reels blocking |
+| VPN (optional) | Adult content filter |
 
-Or, with USB debugging on:
+### Toggle greyed out ("Restricted setting")
+
+Android restricts some permissions for apps installed from an APK. Open **App info → ⋮ → Allow restricted settings**, then grant them again. Or, over USB:
+
 ```sh
 adb shell appops set ch.puc.blocker ACCESS_RESTRICTED_SETTINGS allow
-adb shell appops set ch.puc.blocker GET_USAGE_STATS allow
-adb shell appops set ch.puc.blocker SYSTEM_ALERT_WINDOW allow
 ```
 
-## Edge cases & limitations
-- **Detection latency is about 1 s**, so a blocked app may flash briefly before the overlay covers it.
-- **OEM battery killers** (Xiaomi, Huawei, Samsung, OnePlus and others) may still stop the service even with the battery exemption. Also allow autostart and "no restrictions" in the vendor settings (see dontkillmyapp.com).
-- **Bypassable by design**: uninstalling the app, revoking usage access or overlay permission, force-stopping it, or changing the system clock all defeat the limits. There is no uninstall protection, because Device Admin can't reliably prevent uninstall and adds complexity.
-- **Morning lockout while in use**: if the phone is already unlocked when morning starts, that moment counts as the first unlock.
-- **Picture-in-picture detection** uses "paused but not stopped" usage events, so an app partly covered by another app's dialog also counts as in use.
-- **Time while blocked isn't counted** toward the daily total.
-- **Closing other apps**: Android 14+ doesn't let one app kill another app's process, so a blocked app is closed by moving it to the background and taking audio focus (which pauses well-behaved players). On Android 13 its process is also killed. Its Recents entry can't be removed, but reopening it from Recents closes it again.
-- **Usage counters are saved about every 15 s** (and right away when a cooldown starts or the app changes), not every second.
-- **`USE_EXACT_ALARM`** is auto-granted for sideloaded use but would be rejected on Google Play. The code falls back to an inexact alarm if exact alarms aren't allowed. Since counters are keyed by date, the reset stays correct either way; the alarm only prunes old rows and refreshes the service promptly.
-- **Edit window**: settings re-lock when the screen leaves the foreground, including while you're granting a permission.
+## Good to know
+
+- The block kicks in within about a second, so a blocked app may flash briefly.
+- Android 14+ doesn't let one app kill another, so a blocked app is sent to the background and its media is paused. Reopening it closes it again.
+- Some phone makers (Xiaomi, Samsung, OnePlus…) kill background apps aggressively. Allow autostart and "no restrictions" ([dontkillmyapp.com](https://dontkillmyapp.com)).
+- The adult content filter pauses itself while Private DNS is set, since Private DNS takes over all lookups.
+- It's a self-control tool, not a lock: revoking permissions or changing the clock gets around it.
+
+## Development
+
+```sh
+./gradlew :app:testDebugUnitTest
+```
+
+| Path | What's there |
+|---|---|
+| `domain/` | Pure logic with unit tests: rules, quiz, rewards, quotes, DNS packets |
+| `data/` | Room database |
+| `service/` | Blocker (foreground service), accessibility guard, DNS filter, notifications |
+| `overlay/` | Timer, block screen, pause screen |
+| `ui/` | Jetpack Compose screens and theme |
