@@ -31,6 +31,10 @@ data class GlobalSettings(
     val sessionGraceSec: Int = 90,
     /** Adult content filter (local DNS VPN, see WebFilterService). */
     @ColumnInfo(defaultValue = "0") val webFilter: Boolean = false,
+    /** Comma-separated packages routed through the filter; empty means every app. */
+    @ColumnInfo(defaultValue = "") val filterApps: String = "",
+    /** The filter also blocks ads and trackers (AdGuard DNS Family instead of Cloudflare for Families). */
+    @ColumnInfo(defaultValue = "0") val blockAds: Boolean = false,
     /** A short breathing pause before each new session of a tracked app. */
     @ColumnInfo(defaultValue = "1") val pauseBeforeOpen: Boolean = true,
     /** Back out of YouTube Shorts and Instagram Reels (needs the tamper guard's accessibility service). */
@@ -131,3 +135,6 @@ data class RewardUnlock(
     val untilMs: Long,
     val costMin: Int,
 )
+
+/** [GlobalSettings.filterApps] as a set; empty means every app. */
+val GlobalSettings.filterAppSet: Set<String> get() = filterApps.split(',').filter { it.isNotBlank() }.toSet()

@@ -434,14 +434,40 @@ class SettingsViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
-    /** Switching the filter on is instant; off needs the unlock, like every other loosening. */
+    /** Optional and free either way: some apps (e.g. Duolingo) can't reach their servers through the filter. */
     fun setWebFilter(on: Boolean) {
         val s = settings.value ?: return
-        if (!on && !requireUnlock()) return
         viewModelScope.launch {
             dao.upsertSettings(s.copy(webFilter = on))
             log("Adult content filter", s.webFilter, on)
         }
+    }
+
+    /** Ads and trackers are blocked too (a different DNS provider). Free either way. */
+    fun setBlockAds(on: Boolean) {
+        val s = settings.value ?: return
+        viewModelScope.launch {
+            dao.upsertSettings(s.copy(blockAds = on))
+            log("Block ads", s.blockAds, on)
+        }
+    }
+
+    /** Which apps go through the filter (empty: all). Free to change, like the filter itself. */
+    fun setFilterApps(pkgs: Set<String>) {
+        val s = settings.value ?: return
+        viewModelScope.launch {
+            dao.upsertSettings(s.copy(filterApps = pkgs.sorted().joinToString(",")))
+            log("Filtered apps", s.filterApps.ifEmpty { "all" }, pkgs.ifEmpty { setOf("all") }.joinToString())
+        }
+    }
+
+    /** Installed apps with a launcher icon, as (package, label), sorted by label. */
+    fun launchableApps(): List<Pair<String, String>> {
+        val app = getApplication<Application>()
+        val pm = app.packageManager
+        return pm.queryIntentActivities(Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER), 0)
+            .map { it.activityInfo.packageName to it.loadLabel(pm).toString() }
+            .filter { it.first != app.packageName }.distinctBy { it.first }.sortedBy { it.second.lowercase() }
     }
 
     /** Lets Settings show Social Blocker's stop/uninstall/disable screens for a few minutes. Needs the unlock. */

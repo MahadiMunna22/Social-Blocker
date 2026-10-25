@@ -26,6 +26,18 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.ui.text.style.TextOverflow
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.Dispatchers
+import androidx.compose.runtime.produceState
+import ch.puc.blocker.data.filterAppSet
+import androidx.compose.foundation.lazy.items
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.Button
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -693,7 +705,7 @@ private fun FocusTab(vm: SettingsViewModel) {
                 NavRow("Preview", "See the block screen", vm::previewOverlay)
             }
         }
-        item { Group("Protection") { ProtectionSection(vm, s.webFilter, unlocked, now) } }
+        item { Group("Protection") { ProtectionSection(vm, s.webFilter, s.filterAppSet, s.blockAds, unlocked, now) } }
     }
 }
 
@@ -762,7 +774,7 @@ private fun QuotesSection(vm: SettingsViewModel, s: GlobalSettings) = Column(Mod
  * Their state lives in system settings, so [now] (ticking each second) makes them re-read it.
  */
 @Composable
-private fun ProtectionSection(vm: SettingsViewModel, filterOn: Boolean, unlocked: Boolean, now: Long) {
+private fun ProtectionSection(vm: SettingsViewModel, filterOn: Boolean, filterApps: Set<String>, blockAds: Boolean, unlocked: Boolean, now: Long) {
     val ctx = LocalContext.current
     // Android asks once for VPN consent; the setting is saved only if it's given.
     val consent = rememberLauncherForActivityResult(ActivityResultContracts.StartActivityForResult()) {
@@ -775,13 +787,26 @@ private fun ProtectionSection(vm: SettingsViewModel, filterOn: Boolean, unlocked
         "Adult content filter",
         when {
             privateDns != null -> "Paused: Private DNS is on ($privateDns)"
-            !filterOn -> "Blocks adult websites"
+            !filterOn -> "Blocks adult websites. Optional, turn off anytime"
             WebFilterService.running -> "On"
             else -> "Not connected. Tap to reconnect"
         },
         filterOn, { on -> if (on) enableFilter() else vm.setWebFilter(false) },
         alert = broken, onClick = if (broken) enableFilter else null,
     )
+    if (filterOn) {
+        var picking by remember { mutableStateOf(false) }
+        val labels = remember(filterApps) { vm.launchableApps().filter { it.first in filterApps }.map { it.second } }
+        RowDivider()
+        ToggleRow("Also block ads", "Ads and trackers in apps and websites. Not YouTube or Instagram ads", blockAds, onChange = vm::setBlockAds)
+        RowDivider()
+        NavRow("Filtered apps", when {
+            filterApps.isEmpty() -> "All apps"
+            labels.size <= 2 -> labels.joinToString()
+            else -> "${labels.take(2).joinToString()} +${labels.size - 2}"
+        }) { picking = true }
+        if (picking) FilterAppsSheet(vm, filterApps) { picking = false }
+    }
     RowDivider()
     val protectedNow = Protection.active(ctx)
     val guardOn = GuardService.enabled(ctx)
@@ -818,6 +843,61 @@ private fun NavRow(title: String, subtitle: String, onClick: () -> Unit) = Row(
         Text(subtitle, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
     Icon(Icons.AutoMirrored.Filled.KeyboardArrowRight, null, tint = MaterialTheme.colorScheme.onSurfaceVariant)
+}
+
+/** Picks the apps routed through the adult content filter; everything else connects as usual. Rows match Today's app list. */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun FilterAppsSheet(vm: SettingsViewModel, current: Set<String>, onDismiss: () -> Unit) {
+    val all by produceState<List<Pair<String, String>>?>(null) { value = withContext(Dispatchers.IO) { vm.launchableApps() } }
+    val rows by vm.rows.collectAsStateWithLifecycle()
+    val limited = rows.map { it.app.packageName }.toSet()
+    var picked by remember { mutableStateOf(current) }
+    val toggle = { pkg: String -> picked = if (pkg in picked) picked - pkg else picked + pkg }
+    ModalBottomSheet(onDismissRequest = onDismiss, sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)) {
+        Column(Modifier.padding(horizontal = 24.dp)) {
+            Text("Filtered apps", style = MaterialTheme.typography.titleLarge)
+            Text("Only the apps you tick go through the filter; the others connect as usual. None ticked: every app.",
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+        val apps = all
+        if (apps == null) Box(Modifier.fillMaxWidth().height(160.dp), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+        else LazyColumn(
+            Modifier.weight(1f, fill = false), contentPadding = PaddingValues(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            // Your limited apps first, then everything else, each in one card like on Today.
+            apps.partition { it.first in limited }.toList().zip(listOf("Your apps", "Other apps")).forEach { (list, title) ->
+                if (list.isNotEmpty()) item(key = title) {
+                    Column {
+                        Text(title.uppercase(), Modifier.padding(start = 16.dp, bottom = 4.dp), style = MaterialTheme.typography.labelMedium,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant, letterSpacing = 0.8.sp)
+                        WhiteCard {
+                            Column {
+                                list.forEachIndexed { i, (pkg, label) ->
+                                    if (i > 0) HorizontalDivider(Modifier.padding(start = 66.dp), color = MaterialTheme.colorScheme.outlineVariant)
+                                    Row(
+                                        Modifier.fillMaxWidth().clickable { toggle(pkg) }.padding(horizontal = 16.dp, vertical = 10.dp),
+                                        verticalAlignment = Alignment.CenterVertically,
+                                    ) {
+                                        AppIcon(pkg, label, 38.dp)
+                                        Text(label, Modifier.weight(1f).padding(horizontal = 12.dp), fontWeight = FontWeight.SemiBold,
+                                            maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                        Checkbox(pkg in picked, { toggle(pkg) })
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Row(Modifier.padding(16.dp), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+            OutlinedButton({ picked = emptySet() }, Modifier.height(52.dp), shape = RoundedCornerShape(16.dp)) { Text("All apps") }
+            Button({ vm.setFilterApps(picked); onDismiss() }, Modifier.weight(1f).height(52.dp), shape = RoundedCornerShape(16.dp)) {
+                Text(if (picked.isEmpty()) "Save · all apps" else "Save · ${picked.size} app${if (picked.size == 1) "" else "s"}", fontWeight = FontWeight.SemiBold)
+            }
+        }
+    }
 }
 
 /** One-line hint shown above locked controls. */

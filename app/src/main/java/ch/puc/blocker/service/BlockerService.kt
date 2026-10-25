@@ -25,6 +25,7 @@ import androidx.lifecycle.lifecycleScope
 import ch.puc.blocker.BlockerApp
 import ch.puc.blocker.Day
 import ch.puc.blocker.R
+import ch.puc.blocker.data.filterAppSet
 import ch.puc.blocker.data.DailyUsage
 import ch.puc.blocker.data.DayState
 import ch.puc.blocker.data.GlobalSettings
@@ -185,7 +186,7 @@ class BlockerService : LifecycleService() {
                 settings = it
                 GuardService.blockShortForm = it?.blockShortForm == true
                 Quotes.sources(it?.quoteMask ?: 0, it?.quoteSource ?: 0).let { q -> overlay.quoteSources = q; pause.quoteSources = q }
-                WebFilterService.sync(this@BlockerService, it?.webFilter == true)
+                WebFilterService.sync(this@BlockerService, it?.webFilter == true, it?.filterAppSet.orEmpty(), it?.blockAds == true)
             }
         }
         lifecycleScope.launch {
@@ -244,7 +245,7 @@ class BlockerService : LifecycleService() {
         lastSystemSync = 0 // catch up on anything used while we slept
         // Screen-off pauses every activity, so start clean: this drops any app whose process died without a pause event.
         settledResumed = emptyMap(); settledPaused = emptyMap(); settledAt = System.currentTimeMillis() - 2_000
-        WebFilterService.sync(this, settings?.webFilter == true) // Private DNS may have changed meanwhile
+        WebFilterService.sync(this, settings?.webFilter == true, settings?.filterAppSet.orEmpty(), settings?.blockAds == true) // Private DNS may have changed meanwhile
     }
 
     private suspend fun tick() {

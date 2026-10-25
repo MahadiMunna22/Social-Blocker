@@ -24,7 +24,7 @@ import java.net.InetAddress
 
 /**
  * Adult content filter: a local VPN that only carries DNS. Every lookup is forwarded to Cloudflare for
- * Families, which answers 0.0.0.0 for adult and malware sites; all other traffic skips the tunnel.
+ * Families (or AdGuard DNS Family with ad blocking on), which answers 0.0.0.0 for blocked sites; all other traffic skips the tunnel.
  */
 class WebFilterService : VpnService() {
 
@@ -32,11 +32,17 @@ class WebFilterService : VpnService() {
         private const val TAG = "WebFilter"
         private const val TUN_ADDRESS = "10.111.222.2"
         private const val FAKE_DNS = "10.111.222.1"
-        // ponytail: filtering is Cloudflare's list; bundle our own blocklist if it misses too much.
-        private val UPSTREAM = listOf("1.1.1.3", "1.0.0.3")
+        // ponytail: filtering is the provider's list; bundle our own blocklist if it misses too much.
+        private val ADULT_ONLY = listOf("1.1.1.3", "1.0.0.3")         // Cloudflare for Families
+        private val ADULT_AND_ADS = listOf("94.140.14.15", "94.140.15.16") // AdGuard DNS Family: adult, ads, trackers
+        /** Read per lookup, so switching it needs no reconnect. */
+        @Volatile private var upstream = ADULT_ONLY
 
         @Volatile var running = false
             private set
+        /** Packages the running tunnel carries; empty means every app. */
+        @Volatile private var routed: Set<String> = emptySet()
+        private const val EXTRA_APPS = "apps"
 
         /**
          * The Private DNS server in strict mode (e.g. Kahf's), or null. Strict mode sends every lookup there over
@@ -48,12 +54,17 @@ class WebFilterService : VpnService() {
             return cm.allNetworks.firstNotNullOfOrNull { cm.getLinkProperties(it)?.privateDnsServerName }
         }
 
-        /** Starts or stops the filter to match the setting. Needs VPN consent first (asked when it's switched on). */
-        fun sync(context: Context, on: Boolean) {
+        /**
+         * Starts, stops or re-routes the filter to match the setting. Only [apps] go through it (all apps when empty),
+         * so apps that can't work with it (e.g. Duolingo) can stay outside. Needs VPN consent first.
+         */
+        fun sync(context: Context, on: Boolean, apps: Set<String>, blockAds: Boolean) {
+            upstream = if (blockAds) ADULT_AND_ADS else ADULT_ONLY
             val intent = Intent(context, WebFilterService::class.java)
             if (!on || privateDnsServer(context) != null) { if (running) context.stopService(intent); return }
-            if (running || prepare(context) != null) return
-            runCatching { context.startService(intent) }.onFailure { Log.w(TAG, "Could not start filter", it) }
+            if ((running && apps == routed) || prepare(context) != null) return
+            runCatching { context.startService(intent.putExtra(EXTRA_APPS, apps.toTypedArray())) }
+                .onFailure { Log.w(TAG, "Could not start filter", it) }
         }
     }
 
@@ -61,13 +72,19 @@ class WebFilterService : VpnService() {
     private var tun: ParcelFileDescriptor? = null
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
-        if (tun == null) {
+        val apps = intent?.getStringArrayExtra(EXTRA_APPS)?.toSet() ?: routed
+        if (tun == null || apps != routed) {
+            // A new tunnel replaces the old one; the old pump stops once its descriptor is closed.
+            val old = tun
             tun = Builder()
                 .setSession("Adult content filter")
                 .addAddress(TUN_ADDRESS, 32)
                 .addDnsServer(FAKE_DNS)
                 .addRoute(FAKE_DNS, 32) // only DNS enters the tunnel
+                .apply { apps.forEach { runCatching { addAllowedApplication(it) } } } // uninstalled ones are skipped
                 .establish()
+            runCatching { old?.close() }
+            routed = apps
             tun?.let { fd -> running = true; scope.launch { pump(fd) } } ?: stopSelf()
         }
         return START_STICKY
@@ -75,6 +92,7 @@ class WebFilterService : VpnService() {
 
     override fun onDestroy() {
         running = false
+        routed = emptySet()
         scope.cancel()
         runCatching { tun?.close() }
         tun = null
@@ -102,7 +120,7 @@ class WebFilterService : VpnService() {
     }
 
     private fun forward(query: ByteArray): ByteArray? {
-        for (server in UPSTREAM) runCatching {
+        for (server in upstream) runCatching {
             DatagramSocket().use { s ->
                 protect(s) // otherwise the lookup would loop back into the tunnel
                 s.soTimeout = 3_000

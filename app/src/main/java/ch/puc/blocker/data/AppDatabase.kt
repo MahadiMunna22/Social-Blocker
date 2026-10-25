@@ -130,7 +130,7 @@ class DropVocabTable : AutoMigrationSpec
 @Database(
     entities = [TrackedApp::class, GlobalSettings::class, DailyUsage::class, DayState::class,
         QuizItem::class, ChangeLog::class, ChallengeResult::class, UnlockWait::class, TaskItem::class, RewardUnlock::class],
-    version = 12,
+    version = 14,
     autoMigrations = [
         AutoMigration(from = 1, to = 2),
         AutoMigration(from = 2, to = 3, spec = DropVocabTable::class),
@@ -143,6 +143,8 @@ class DropVocabTable : AutoMigrationSpec
         AutoMigration(from = 9, to = 10),
         AutoMigration(from = 10, to = 11),
         AutoMigration(from = 11, to = 12),
+        AutoMigration(from = 12, to = 13),
+        AutoMigration(from = 13, to = 14),
     ],
 )
 abstract class AppDatabase : RoomDatabase() {

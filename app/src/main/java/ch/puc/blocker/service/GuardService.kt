@@ -23,7 +23,7 @@ class GuardService : AccessibilityService() {
         // ponytail: English wording only; add translations if the phone language changes.
         private val DANGER = listOf(
             "Force stop", "Uninstall", "Clear storage", "Clear data", "Use Social Blocker",
-            "Disconnect", "Forget VPN", "Always-on VPN", "Permit usage access", "Allow display over other apps",
+            "Permit usage access", "Allow display over other apps", // VPN screens stay free: the filter is optional
         )
         const val PAUSE_MS = 5 * 60_000L
 
